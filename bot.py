@@ -4,6 +4,9 @@ from discord.ext import commands
 from datetime import timedelta
 import json
 import os
+from dotenv import load_dotenv
+
+load_dotenv("/home/container/.env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
