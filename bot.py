@@ -74,12 +74,13 @@ DEFAULT_WELCOME_MESSAGE = (
     "Welcome to {server}, {member}!\n\n"
     "• Get your roles in #roles\n"
     "• Remember to read the #rules\n"
-    "• Check out my socials! https://guns.lol/atide\n\n"
+    "• Check out my socials! {socials}\n\n"
     "Have fun!\n\n"
     "*.* ─────⋆⋅☆⋅⋆───── *.*"
 )
 
 DEFAULT_WELCOME_IMAGE = None  # gif/image URL shown at the bottom of the embed
+DEFAULT_WELCOME_SOCIALS = None  # your socials link, shown wherever {socials} is used
 
 
 def load_welcome_settings():
@@ -108,6 +109,7 @@ def get_guild_welcome_settings(guild_id: str):
             "channel_id": None,
             "message": DEFAULT_WELCOME_MESSAGE,
             "image_url": DEFAULT_WELCOME_IMAGE,
+            "socials": DEFAULT_WELCOME_SOCIALS,
             "enabled": True
         }
         save_welcome_settings(welcome_settings)
@@ -124,6 +126,7 @@ def build_welcome_embed(member: discord.Member, settings: dict) -> discord.Embed
             .replace("{name}", member.display_name)
             .replace("{server}", member.guild.name)
             .replace("{count}", str(member.guild.member_count))
+            .replace("{socials}", settings.get("socials") or "N/A")
     )
 
     embed = discord.Embed(
@@ -287,6 +290,41 @@ async def welcome_setimage(
 
 
 # -------------------------
+# WELCOME: SET SOCIALS
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-setsocials",
+    description="Set your socials link used in the {socials} placeholder."
+)
+@app_commands.describe(
+    url="Link to your socials (leave blank to remove it)"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_setsocials(
+    interaction: discord.Interaction,
+    url: str = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    settings["socials"] = url
+    save_welcome_settings(welcome_settings)
+
+    if url:
+        await interaction.response.send_message(
+            f"✅ Socials link set to {url}. It'll show up anywhere your "
+            f"welcome message uses `{{socials}}`.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "✅ Socials link removed.",
+            ephemeral=True
+        )
+
+
+# -------------------------
 # WELCOME: TOGGLE ON/OFF
 # -------------------------
 
@@ -311,6 +349,32 @@ async def welcome_toggle(
     state = "enabled" if enabled else "disabled"
     await interaction.response.send_message(
         f"✅ Welcome messages are now **{state}**.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# WELCOME: RESET TO DEFAULT
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-reset",
+    description="Reset the welcome message, image, and socials back to default."
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_reset(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    settings["message"] = DEFAULT_WELCOME_MESSAGE
+    settings["image_url"] = DEFAULT_WELCOME_IMAGE
+    settings["socials"] = DEFAULT_WELCOME_SOCIALS
+    save_welcome_settings(welcome_settings)
+
+    await interaction.response.send_message(
+        "✅ Welcome message, image/gif, and socials have been reset to "
+        "default. Your welcome channel and enabled/disabled state were "
+        "left untouched. Use `/welcome-test` to preview.",
         ephemeral=True
     )
 
@@ -369,6 +433,11 @@ async def welcome_settings_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Image/GIF",
         value=settings.get("image_url") or "Not set",
+        inline=False
+    )
+    embed.add_field(
+        name="Socials",
+        value=settings.get("socials") or "Not set",
         inline=False
     )
     embed.add_field(
