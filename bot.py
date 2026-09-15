@@ -72,6 +72,8 @@ DEFAULT_WELCOME_MESSAGE = (
     "★*. WELCOME *.°\n"
     "*.* ─────⋆⋅☆⋅⋆───── *.*\n\n"
     "Welcome to {server}, {member}!\n\n"
+    "• Get your roles in #roles\n"
+    "• Remember to read the #rules\n"
     "• Check out my socials! {socials}\n\n"
     "Have fun!\n\n"
     "*.* ─────⋆⋅☆⋅⋆───── *.*"
@@ -961,6 +963,66 @@ async def unlock(interaction: discord.Interaction):
     await interaction.response.send_message(
         "🔓 This channel has been unlocked."
     )
+
+
+# -------------------------
+# COMMANDS LIST
+# -------------------------
+
+@bot.tree.command(
+    name="commands",
+    description="Show a list of all available commands."
+)
+async def commands_list(interaction: discord.Interaction):
+
+    embed = discord.Embed(
+        title="📖 Command List",
+        description="Here's everything I can do!",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="🛡️ Moderation",
+        value=(
+            "`/kick` — Kick a member\n"
+            "`/ban` — Ban a member\n"
+            "`/unban` — Unban a user by ID\n"
+            "`/timeout` — Timeout a member\n"
+            "`/untimeout` — Remove a member's timeout\n"
+            "`/warn` — Warn a member\n"
+            "`/warnings` — View a member's warnings\n"
+            "`/clearwarnings` — Clear a member's warnings\n"
+            "`/clear` — Bulk delete messages\n"
+            "`/lock` — Lock the current channel\n"
+            "`/unlock` — Unlock the current channel"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="👋 Welcome Messages",
+        value=(
+            "`/welcome-setchannel` — Set the welcome channel\n"
+            "`/welcome-setmessage` — Set the welcome text\n"
+            "`/welcome-setimage` — Set the welcome gif/image\n"
+            "`/welcome-setsocials` — Set your socials link\n"
+            "`/welcome-toggle` — Enable/disable welcome messages\n"
+            "`/welcome-test` — Preview the welcome message\n"
+            "`/welcome-settings` — View current welcome config\n"
+            "`/welcome-reset` — Reset welcome settings to default"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="ℹ️ Other",
+        value="`/commands` — Show this list",
+        inline=False
+    )
+
+    embed.set_footer(text="Most moderation and welcome commands require the relevant server permissions.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # -------------------------
