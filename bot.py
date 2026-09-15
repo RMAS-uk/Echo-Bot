@@ -11,7 +11,7 @@ load_dotenv("/home/container/.env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # CHANGE THIS to your Discord SERVER ID
-GUILD_ID = 1538122777628778616
+GUILD_ID = 1533843796834390116
 
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
