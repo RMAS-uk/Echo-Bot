@@ -18,6 +18,9 @@ WELCOME_FILE = "welcome_settings.json"
 RULES_FILE = "rules_settings.json"
 RULES_IMAGE_PATH = "rules.png"  # fallback local image, used if no URL is set
 
+WARNING_MUTE_THRESHOLD = 3  # warnings needed before an auto-mute
+WARNING_MUTE_HOURS = 48     # length of that auto-mute
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -837,21 +840,52 @@ async def warn(
 
     total = len(warnings[guild_id][user_id])
 
-    try:
-        await member.send(
-            f"⚠️ You have received a warning in "
-            f"**{interaction.guild.name}**.\n\n"
-            f"Reason: {reason}\n"
-            f"Warning #{total}"
+    # Auto-mute once the member hits the warning threshold.
+    muted = False
+    if total >= WARNING_MUTE_THRESHOLD and member.moderatable:
+        try:
+            await member.timeout(
+                timedelta(hours=WARNING_MUTE_HOURS),
+                reason=f"Reached {total} warnings"
+            )
+            muted = True
+        except discord.Forbidden:
+            pass
+
+    dm_lines = [
+        f"⚠️ You have received a warning in **{interaction.guild.name}**.",
+        "",
+        f"Reason: {reason}",
+        f"Warning #{total}"
+    ]
+    if muted:
+        dm_lines.append(
+            f"\nYou've reached **{WARNING_MUTE_THRESHOLD} warnings** and "
+            f"have been muted for **{WARNING_MUTE_HOURS} hours**."
         )
+
+    try:
+        await member.send("\n".join(dm_lines))
     except discord.Forbidden:
         pass
 
-    await interaction.response.send_message(
-        f"⚠️ **{member}** has been warned.\n"
-        f"Reason: {reason}\n"
+    response_lines = [
+        f"⚠️ **{member}** has been warned.",
+        f"Reason: {reason}",
         f"Total warnings: **{total}**"
-    )
+    ]
+    if muted:
+        response_lines.append(
+            f"🔇 **{member}** reached {WARNING_MUTE_THRESHOLD} warnings "
+            f"and has been muted for **{WARNING_MUTE_HOURS} hours**."
+        )
+    elif total >= WARNING_MUTE_THRESHOLD:
+        response_lines.append(
+            "❌ I couldn't mute this member (missing permissions or "
+            "role hierarchy)."
+        )
+
+    await interaction.response.send_message("\n".join(response_lines))
 
 
 # -------------------------
@@ -915,8 +949,67 @@ async def view_warnings(
 
 
 # -------------------------
-# CLEAR WARNINGS
+# VIEW ALL WARNINGS (SERVER-WIDE)
 # -------------------------
+
+@bot.tree.command(
+    name="viewwarnings",
+    description="View everyone in this server who has at least one warning."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def view_all_warnings(interaction: discord.Interaction):
+
+    guild_id = str(interaction.guild.id)
+    guild_warnings = warnings.get(guild_id, {})
+
+    # Only keep users who still have at least one warning on record.
+    active = {
+        user_id: user_warnings
+        for user_id, user_warnings in guild_warnings.items()
+        if user_warnings
+    }
+
+    if not active:
+        await interaction.response.send_message(
+            "✅ Nobody in this server currently has any warnings.",
+            ephemeral=True
+        )
+        return
+
+    # Most-warned members first.
+    sorted_users = sorted(
+        active.items(),
+        key=lambda item: len(item[1]),
+        reverse=True
+    )
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings — {interaction.guild.name}",
+        description=f"**{len(sorted_users)}** member(s) have warnings.",
+        color=discord.Color.orange()
+    )
+
+    for user_id, user_warnings in sorted_users[:25]:
+        member = interaction.guild.get_member(int(user_id))
+        who = member.mention if member else f"Unknown user (`{user_id}`)"
+
+        latest_reason = user_warnings[-1]["reason"]
+        count = len(user_warnings)
+
+        flag = " 🔇" if count >= WARNING_MUTE_THRESHOLD else ""
+
+        embed.add_field(
+            name=f"{who} — {count} warning(s){flag}",
+            value=f"Most recent: {latest_reason}",
+            inline=False
+        )
+
+    if len(sorted_users) > 25:
+        embed.set_footer(
+            text=f"Showing 25 of {len(sorted_users)} members with warnings."
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(
     name="clearwarnings",
@@ -1181,6 +1274,7 @@ async def commands_list(interaction: discord.Interaction):
             "`/untimeout` — Remove a member's timeout\n"
             "`/warn` — Warn a member\n"
             "`/warnings` — View a member's warnings\n"
+            "`/viewwarnings` — View everyone with warnings server-wide\n"
             "`/clearwarnings` — Clear a member's warnings\n"
             "`/clear` — Bulk delete messages\n"
             "`/lock` — Lock the current channel\n"
@@ -1220,7 +1314,13 @@ async def commands_list(interaction: discord.Interaction):
         inline=False
     )
 
-    embed.set_footer(text="All commands require the Administrator permission.")
+    embed.set_footer(
+        text=(
+            "All commands require the Administrator permission. "
+            f"{WARNING_MUTE_THRESHOLD} warnings = auto-mute for "
+            f"{WARNING_MUTE_HOURS} hours."
+        )
+    )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
