@@ -14,6 +14,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1538122777628778616
 
 WARNINGS_FILE = "warnings.json"
+WELCOME_FILE = "welcome_settings.json"
 
 intents = discord.Intents.default()
 intents.members = True
@@ -64,6 +65,93 @@ warnings = load_warnings()
 
 
 # -------------------------
+# WELCOME SETTINGS
+# -------------------------
+
+DEFAULT_WELCOME_MESSAGE = (
+    "★*. WELCOME *.°\n"
+    "*.* ─────⋆⋅☆⋅⋆───── *.*\n\n"
+    "Welcome to {server}, {member}!\n\n"
+    "• Get your roles in #roles\n"
+    "• Remember to read the #rules\n"
+    "• Check out my socials! https://guns.lol/atide\n\n"
+    "Have fun!\n\n"
+    "*.* ─────⋆⋅☆⋅⋆───── *.*"
+)
+
+DEFAULT_WELCOME_IMAGE = None  # gif/image URL shown at the bottom of the embed
+
+
+def load_welcome_settings():
+    if not os.path.exists(WELCOME_FILE):
+        return {}
+
+    try:
+        with open(WELCOME_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_welcome_settings(data):
+    with open(WELCOME_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+
+welcome_settings = load_welcome_settings()
+
+
+def get_guild_welcome_settings(guild_id: str):
+    """Return this guild's welcome config, creating defaults if missing."""
+    if guild_id not in welcome_settings:
+        welcome_settings[guild_id] = {
+            "channel_id": None,
+            "message": DEFAULT_WELCOME_MESSAGE,
+            "image_url": DEFAULT_WELCOME_IMAGE,
+            "enabled": True
+        }
+        save_welcome_settings(welcome_settings)
+
+    return welcome_settings[guild_id]
+
+
+def build_welcome_embed(member: discord.Member, settings: dict) -> discord.Embed:
+    text = settings.get("message", DEFAULT_WELCOME_MESSAGE)
+
+    text = (
+        text.replace("{member}", member.mention)
+            .replace("{mention}", member.mention)
+            .replace("{name}", member.display_name)
+            .replace("{server}", member.guild.name)
+            .replace("{count}", str(member.guild.member_count))
+    )
+
+    embed = discord.Embed(
+        description=text,
+        color=discord.Color.dark_theme()
+    )
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    image_url = settings.get("image_url")
+    if image_url:
+        embed.set_image(url=image_url)
+
+    embed.set_footer(
+        text=f"You are our {member.guild.member_count}{_ordinal_suffix(member.guild.member_count)} member!"
+    )
+    embed.timestamp = discord.utils.utcnow()
+
+    return embed
+
+
+def _ordinal_suffix(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+# -------------------------
 # BOT STARTUP
 # -------------------------
 
@@ -71,6 +159,225 @@ warnings = load_warnings()
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
+
+
+# -------------------------
+# WELCOME EVENT
+# -------------------------
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild_id = str(member.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    if not settings.get("enabled", True):
+        return
+
+    channel_id = settings.get("channel_id")
+    if not channel_id:
+        return
+
+    channel = member.guild.get_channel(channel_id)
+    if channel is None:
+        return
+
+    embed = build_welcome_embed(member, settings)
+
+    try:
+        await channel.send(
+            content=f"Welcome, {member.mention}!",
+            embed=embed
+        )
+    except discord.Forbidden:
+        pass
+
+
+# -------------------------
+# WELCOME: SET CHANNEL
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-setchannel",
+    description="Set the channel where welcome messages are sent."
+)
+@app_commands.describe(
+    channel="The channel to send welcome messages in"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_setchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    settings["channel_id"] = channel.id
+    save_welcome_settings(welcome_settings)
+
+    await interaction.response.send_message(
+        f"✅ Welcome messages will now be sent in {channel.mention}.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# WELCOME: SET MESSAGE
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-setmessage",
+    description="Set the welcome message text."
+)
+@app_commands.describe(
+    message=(
+        "Welcome text. Placeholders: {member} {name} {server} {count}. "
+        "Use \\n for new lines."
+    )
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_setmessage(
+    interaction: discord.Interaction,
+    message: str
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    # allow literal \n typed by the user to become real newlines
+    settings["message"] = message.replace("\\n", "\n")
+    save_welcome_settings(welcome_settings)
+
+    await interaction.response.send_message(
+        "✅ Welcome message updated. Use `/welcome-test` to preview it.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# WELCOME: SET IMAGE/GIF
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-setimage",
+    description="Set the image/gif shown at the bottom of the welcome embed."
+)
+@app_commands.describe(
+    url="Direct URL to an image or gif (leave blank to remove it)"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_setimage(
+    interaction: discord.Interaction,
+    url: str = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    settings["image_url"] = url
+    save_welcome_settings(welcome_settings)
+
+    if url:
+        await interaction.response.send_message(
+            "✅ Welcome image/gif updated.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "✅ Welcome image/gif removed.",
+            ephemeral=True
+        )
+
+
+# -------------------------
+# WELCOME: TOGGLE ON/OFF
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-toggle",
+    description="Enable or disable welcome messages."
+)
+@app_commands.describe(
+    enabled="True to enable, False to disable"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_toggle(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    settings["enabled"] = enabled
+    save_welcome_settings(welcome_settings)
+
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(
+        f"✅ Welcome messages are now **{state}**.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# WELCOME: TEST / PREVIEW
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-test",
+    description="Preview the current welcome message."
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_test(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    embed = build_welcome_embed(interaction.user, settings)
+
+    await interaction.response.send_message(
+        content=f"Welcome, {interaction.user.mention}!",
+        embed=embed
+    )
+
+
+# -------------------------
+# WELCOME: VIEW SETTINGS
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-settings",
+    description="View the current welcome message configuration."
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_settings_cmd(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    channel_id = settings.get("channel_id")
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+
+    embed = discord.Embed(
+        title="Welcome Message Settings",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Status",
+        value="Enabled ✅" if settings.get("enabled", True) else "Disabled ❌",
+        inline=True
+    )
+    embed.add_field(
+        name="Channel",
+        value=channel.mention if channel else "Not set",
+        inline=True
+    )
+    embed.add_field(
+        name="Image/GIF",
+        value=settings.get("image_url") or "Not set",
+        inline=False
+    )
+    embed.add_field(
+        name="Message",
+        value=f"```{settings.get('message', DEFAULT_WELCOME_MESSAGE)}```",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # -------------------------
