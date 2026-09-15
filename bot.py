@@ -72,7 +72,7 @@ DEFAULT_WELCOME_MESSAGE = (
     "★*. WELCOME *.°\n"
     "*.* ─────⋆⋅☆⋅⋆───── *.*\n\n"
     "Welcome to {server}, {member}!\n\n"
-    "• Remember to read the #rules\n"
+    "• Remember to read {rules}\n"
     "• Check out my socials! {socials}\n\n"
     "Have fun!\n\n"
     "*.* ─────⋆⋅☆⋅⋆───── *.*"
@@ -80,6 +80,7 @@ DEFAULT_WELCOME_MESSAGE = (
 
 DEFAULT_WELCOME_IMAGE = None  # gif/image URL shown at the bottom of the embed
 DEFAULT_WELCOME_SOCIALS = None  # your socials link, shown wherever {socials} is used
+DEFAULT_RULES_CHANNEL_ID = None  # channel shown wherever {rules} is used
 
 
 def load_welcome_settings():
@@ -109,6 +110,7 @@ def get_guild_welcome_settings(guild_id: str):
             "message": DEFAULT_WELCOME_MESSAGE,
             "image_url": DEFAULT_WELCOME_IMAGE,
             "socials": DEFAULT_WELCOME_SOCIALS,
+            "rules_channel_id": DEFAULT_RULES_CHANNEL_ID,
             "enabled": True
         }
         save_welcome_settings(welcome_settings)
@@ -119,6 +121,13 @@ def get_guild_welcome_settings(guild_id: str):
 def build_welcome_embed(member: discord.Member, settings: dict) -> discord.Embed:
     text = settings.get("message", DEFAULT_WELCOME_MESSAGE)
 
+    rules_channel_id = settings.get("rules_channel_id")
+    rules_channel = (
+        member.guild.get_channel(rules_channel_id)
+        if rules_channel_id else None
+    )
+    rules_mention = rules_channel.mention if rules_channel else "the rules"
+
     text = (
         text.replace("{member}", member.mention)
             .replace("{mention}", member.mention)
@@ -126,6 +135,7 @@ def build_welcome_embed(member: discord.Member, settings: dict) -> discord.Embed
             .replace("{server}", member.guild.name)
             .replace("{count}", str(member.guild.member_count))
             .replace("{socials}", settings.get("socials") or "N/A")
+            .replace("{rules}", rules_mention)
     )
 
     embed = discord.Embed(
@@ -232,8 +242,8 @@ async def welcome_setchannel(
 )
 @app_commands.describe(
     message=(
-        "Welcome text. Placeholders: {member} {name} {server} {count}. "
-        "Use \\n for new lines."
+        "Welcome text. Placeholders: {member} {name} {server} {count} "
+        "{rules} {socials}. Use \\n for new lines."
     )
 )
 @app_commands.checks.has_permissions(administrator=True)
@@ -286,6 +296,35 @@ async def welcome_setimage(
             "✅ Welcome image/gif removed.",
             ephemeral=True
         )
+
+
+# -------------------------
+# WELCOME: SET RULES CHANNEL
+# -------------------------
+
+@bot.tree.command(
+    name="welcome-setruleschannel",
+    description="Set the channel linked wherever {rules} is used in the welcome message."
+)
+@app_commands.describe(
+    channel="The channel to link (e.g. your #rules channel)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def welcome_setruleschannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_welcome_settings(guild_id)
+
+    settings["rules_channel_id"] = channel.id
+    save_welcome_settings(welcome_settings)
+
+    await interaction.response.send_message(
+        f"✅ {channel.mention} will now show up anywhere your welcome "
+        f"message uses `{{rules}}`.",
+        ephemeral=True
+    )
 
 
 # -------------------------
@@ -415,6 +454,12 @@ async def welcome_settings_cmd(interaction: discord.Interaction):
     channel_id = settings.get("channel_id")
     channel = interaction.guild.get_channel(channel_id) if channel_id else None
 
+    rules_channel_id = settings.get("rules_channel_id")
+    rules_channel = (
+        interaction.guild.get_channel(rules_channel_id)
+        if rules_channel_id else None
+    )
+
     embed = discord.Embed(
         title="Welcome Message Settings",
         color=discord.Color.blurple()
@@ -427,6 +472,11 @@ async def welcome_settings_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Channel",
         value=channel.mention if channel else "Not set",
+        inline=True
+    )
+    embed.add_field(
+        name="Rules Channel",
+        value=rules_channel.mention if rules_channel else "Not set",
         inline=True
     )
     embed.add_field(
@@ -988,6 +1038,7 @@ async def commands_list(interaction: discord.Interaction):
             "`/welcome-setchannel` — Set the welcome channel\n"
             "`/welcome-setmessage` — Set the welcome text\n"
             "`/welcome-setimage` — Set the welcome gif/image\n"
+            "`/welcome-setruleschannel` — Set the {rules} channel link\n"
             "`/welcome-setsocials` — Set your socials link\n"
             "`/welcome-toggle` — Enable/disable welcome messages\n"
             "`/welcome-test` — Preview the welcome message\n"
