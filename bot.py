@@ -15,7 +15,6 @@ GUILD_ID = 1533843796834390116
 
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
-BOT_ROLE_FILE = "bot_role_settings.json"
 
 intents = discord.Intents.default()
 intents.members = True
@@ -102,66 +101,6 @@ def save_welcome_settings(data):
 welcome_settings = load_welcome_settings()
 
 
-# -------------------------
-# BOT ROLE (custom permission gate)
-# -------------------------
-# Once set, only members with this role (or real Discord Administrators)
-# can use ANY of this bot's commands. This replaces the individual
-# kick_members / ban_members / manage_messages / etc. checks.
-
-def load_bot_role_settings():
-    if not os.path.exists(BOT_ROLE_FILE):
-        return {}
-
-    try:
-        with open(BOT_ROLE_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_bot_role_settings(data):
-    with open(BOT_ROLE_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
-
-
-bot_role_settings = load_bot_role_settings()
-
-
-def has_bot_role():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        # Real server administrators can always use every command,
-        # so nobody can ever get permanently locked out.
-        if interaction.user.guild_permissions.administrator:
-            return True
-
-        guild_id = str(interaction.guild.id)
-        role_id = bot_role_settings.get(guild_id, {}).get("role_id")
-
-        if role_id is None:
-            raise app_commands.CheckFailure(
-                "❌ No bot role has been set yet. Ask a server "
-                "administrator to run `/setbotrole`."
-            )
-
-        role = interaction.guild.get_role(role_id)
-
-        if role is None:
-            raise app_commands.CheckFailure(
-                "❌ The configured bot role no longer exists. Ask a "
-                "server administrator to run `/setbotrole` again."
-            )
-
-        if role in interaction.user.roles:
-            return True
-
-        raise app_commands.CheckFailure(
-            f"❌ You need the {role.mention} role to use this command."
-        )
-
-    return app_commands.check(predicate)
-
-
 def get_guild_welcome_settings(guild_id: str):
     """Return this guild's welcome config, creating defaults if missing."""
     if guild_id not in welcome_settings:
@@ -225,33 +164,6 @@ async def on_ready():
 
 
 # -------------------------
-# SET BOT ROLE
-# -------------------------
-
-@bot.tree.command(
-    name="setbotrole",
-    description="Set the role required to use this bot's commands."
-)
-@app_commands.describe(
-    role="The role that will be allowed to use all of this bot's commands"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def setbotrole(
-    interaction: discord.Interaction,
-    role: discord.Role
-):
-    guild_id = str(interaction.guild.id)
-    bot_role_settings[guild_id] = {"role_id": role.id}
-    save_bot_role_settings(bot_role_settings)
-
-    await interaction.response.send_message(
-        f"✅ {role.mention} can now use all of my commands. "
-        f"Server administrators can always use them too.",
-        ephemeral=True
-    )
-
-
-# -------------------------
 # WELCOME EVENT
 # -------------------------
 
@@ -293,7 +205,7 @@ async def on_member_join(member: discord.Member):
 @app_commands.describe(
     channel="The channel to send welcome messages in"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_setchannel(
     interaction: discord.Interaction,
     channel: discord.TextChannel
@@ -324,7 +236,7 @@ async def welcome_setchannel(
         "Use \\n for new lines."
     )
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_setmessage(
     interaction: discord.Interaction,
     message: str
@@ -353,7 +265,7 @@ async def welcome_setmessage(
 @app_commands.describe(
     url="Direct URL to an image or gif (leave blank to remove it)"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_setimage(
     interaction: discord.Interaction,
     url: str = None
@@ -387,7 +299,7 @@ async def welcome_setimage(
 @app_commands.describe(
     url="Link to your socials (leave blank to remove it)"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_setsocials(
     interaction: discord.Interaction,
     url: str = None
@@ -422,7 +334,7 @@ async def welcome_setsocials(
 @app_commands.describe(
     enabled="True to enable, False to disable"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_toggle(
     interaction: discord.Interaction,
     enabled: bool
@@ -448,7 +360,7 @@ async def welcome_toggle(
     name="welcome-reset",
     description="Reset the welcome message, image, and socials back to default."
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_reset(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     settings = get_guild_welcome_settings(guild_id)
@@ -474,7 +386,7 @@ async def welcome_reset(interaction: discord.Interaction):
     name="welcome-test",
     description="Preview the current welcome message."
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_test(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     settings = get_guild_welcome_settings(guild_id)
@@ -495,7 +407,7 @@ async def welcome_test(interaction: discord.Interaction):
     name="welcome-settings",
     description="View the current welcome message configuration."
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def welcome_settings_cmd(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     settings = get_guild_welcome_settings(guild_id)
@@ -548,7 +460,7 @@ async def welcome_settings_cmd(interaction: discord.Interaction):
     member="The member to kick",
     reason="Reason for the kick"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def kick(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -604,7 +516,7 @@ async def kick(
     member="The member to ban",
     reason="Reason for the ban"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def ban(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -663,7 +575,7 @@ async def ban(
     user_id="The Discord ID of the user",
     reason="Reason for the unban"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def unban(
     interaction: discord.Interaction,
     user_id: str,
@@ -710,7 +622,7 @@ async def unban(
     minutes="Duration in minutes",
     reason="Reason for the timeout"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def timeout(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -769,7 +681,7 @@ async def timeout(
 @app_commands.describe(
     member="The member to untimeout"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def untimeout(
     interaction: discord.Interaction,
     member: discord.Member
@@ -811,7 +723,7 @@ async def untimeout(
     member="The member to warn",
     reason="Reason for the warning"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def warn(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -867,7 +779,7 @@ async def warn(
 @app_commands.describe(
     member="The member to check"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def view_warnings(
     interaction: discord.Interaction,
     member: discord.Member
@@ -927,7 +839,7 @@ async def view_warnings(
 @app_commands.describe(
     member="The member whose warnings to clear"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def clear_warnings(
     interaction: discord.Interaction,
     member: discord.Member
@@ -958,7 +870,7 @@ async def clear_warnings(
 @app_commands.describe(
     amount="Number of messages to delete (1-100)"
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def clear(
     interaction: discord.Interaction,
     amount: app_commands.Range[int, 1, 100]
@@ -986,7 +898,7 @@ async def clear(
     name="lock",
     description="Lock the current channel."
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def lock(interaction: discord.Interaction):
 
     channel = interaction.channel
@@ -1015,7 +927,7 @@ async def lock(interaction: discord.Interaction):
     name="unlock",
     description="Unlock the current channel."
 )
-@has_bot_role()
+@app_commands.checks.has_permissions(administrator=True)
 async def unlock(interaction: discord.Interaction):
 
     channel = interaction.channel
@@ -1086,21 +998,12 @@ async def commands_list(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="⚙️ Setup",
-        value=(
-            "`/setbotrole` — Set the role allowed to use all bot "
-            "commands *(Administrator only)*"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
         name="ℹ️ Other",
         value="`/commands` — Show this list",
         inline=False
     )
 
-    embed.set_footer(text="Most commands require the bot role set with /setbotrole (or Administrator).")
+    embed.set_footer(text="All commands require the Administrator permission.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1131,16 +1034,6 @@ async def on_app_command_error(
         message = (
             "❌ I don't have the permissions "
             "required for this command."
-        )
-
-    elif isinstance(
-        error,
-        app_commands.CheckFailure
-    ):
-        # has_bot_role() raises CheckFailure with a specific,
-        # user-facing message already baked in.
-        message = str(error) or (
-            "❌ You don't have permission to use this command."
         )
 
     else:
