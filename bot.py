@@ -959,6 +959,8 @@ async def view_warnings(
 @app_commands.checks.has_permissions(administrator=True)
 async def view_all_warnings(interaction: discord.Interaction):
 
+    await interaction.response.defer(ephemeral=True)
+
     guild_id = str(interaction.guild.id)
     guild_warnings = warnings.get(guild_id, {})
 
@@ -970,7 +972,7 @@ async def view_all_warnings(interaction: discord.Interaction):
     }
 
     if not active:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "✅ Nobody in this server currently has any warnings.",
             ephemeral=True
         )
@@ -983,33 +985,57 @@ async def view_all_warnings(interaction: discord.Interaction):
         reverse=True
     )
 
-    embed = discord.Embed(
-        title=f"⚠️ Warnings — {interaction.guild.name}",
-        description=f"**{len(sorted_users)}** member(s) have warnings.",
-        color=discord.Color.orange()
-    )
+    # Discord allows at most 10 embeds per message, and each embed can
+    # only show one avatar, so we build one small embed per member.
+    shown = sorted_users[:10]
+    embeds = []
 
-    for user_id, user_warnings in sorted_users[:25]:
+    for user_id, user_warnings in shown:
         member = interaction.guild.get_member(int(user_id))
-        who = member.mention if member else f"Unknown user (`{user_id}`)"
+        user = member
 
-        latest_reason = user_warnings[-1]["reason"]
+        if user is None:
+            # Not currently in the server (or not cached) - try to
+            # fetch them directly so we can still show their @ and pfp.
+            try:
+                user = await bot.fetch_user(int(user_id))
+            except (discord.NotFound, discord.HTTPException):
+                user = None
+
         count = len(user_warnings)
-
+        latest_reason = user_warnings[-1]["reason"]
         flag = " 🔇" if count >= WARNING_MUTE_THRESHOLD else ""
 
-        embed.add_field(
-            name=f"{who} — {count} warning(s){flag}",
-            value=f"Most recent: {latest_reason}",
-            inline=False
-        )
+        embed = discord.Embed(color=discord.Color.orange())
 
-    if len(sorted_users) > 25:
-        embed.set_footer(
-            text=f"Showing 25 of {len(sorted_users)} members with warnings."
-        )
+        if user:
+            embed.description = (
+                f"{user.mention}\n"
+                f"**{count}** warning(s){flag}\n"
+                f"Most recent: {latest_reason}"
+            )
+            embed.set_thumbnail(url=user.display_avatar.url)
+        else:
+            embed.description = (
+                f"Unknown user (`{user_id}`)\n"
+                f"**{count}** warning(s){flag}\n"
+                f"Most recent: {latest_reason}"
+            )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        embeds.append(embed)
+
+    content = (
+        f"⚠️ **{len(sorted_users)}** member(s) have warnings in "
+        f"**{interaction.guild.name}**."
+    )
+    if len(sorted_users) > 10:
+        content += " Showing the top 10 by warning count."
+
+    await interaction.followup.send(
+        content=content,
+        embeds=embeds,
+        ephemeral=True
+    )
 
 @bot.tree.command(
     name="clearwarnings",
