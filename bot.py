@@ -73,7 +73,6 @@ DEFAULT_WELCOME_MESSAGE = (
     "★*. WELCOME *.°\n"
     "*.* ─────⋆⋅☆⋅⋆───── *.*\n\n"
     "Welcome to {server}, {member}!\n\n"
-    "• Get your roles in #roles\n"
     "• Remember to read the #rules\n"
     "• Check out my socials! {socials}\n\n"
     "Have fun!\n\n"
