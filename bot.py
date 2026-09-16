@@ -1,26 +1,22 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import timedelta, datetime
-import io
+from datetime import timedelta
 import json
 import os
 from dotenv import load_dotenv
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 load_dotenv("/home/container/.env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# CHANGE THIS to your Discord SERVER ID
+GUILD_ID = 1533843796834390116
+
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
 LEAVE_FILE = "leave_settings.json"
 RULES_FILE = "rules_settings.json"
-ACTIVITY_FILE = "activity.json"
 RULES_IMAGE_PATH = "rules.png"  # fallback local image, used if no URL is set
 
 WARNING_MUTE_THRESHOLD = 3  # warnings needed before an auto-mute
@@ -29,7 +25,6 @@ WARNING_MUTE_HOURS = 48     # length of that auto-mute
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-intents.voice_states = True  # needed to track voice activity for /me
 
 
 class ModerationBot(commands.Bot):
@@ -41,9 +36,12 @@ class ModerationBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        await self.tree.sync()
+        guild = discord.Object(id=GUILD_ID)
 
-        print("Global slash commands synced.")
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+
+        print("Slash commands synced.")
 
 
 bot = ModerationBot()
@@ -284,225 +282,6 @@ def _ordinal_suffix(n: int) -> str:
 
 
 # -------------------------
-# ACTIVITY TRACKING (for /me)
-# -------------------------
-
-ACTIVITY_KEEP_DAYS = 35     # how long daily buckets are kept before pruning
-ACTIVITY_WINDOW_DAYS = 14   # the lookback window shown in /me
-
-
-def load_activity():
-    if not os.path.exists(ACTIVITY_FILE):
-        return {}
-
-    try:
-        with open(ACTIVITY_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_activity(data):
-    with open(ACTIVITY_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
-
-
-activity = load_activity()
-
-# In-memory only: tracks who is currently in a voice channel and when
-# they joined it, so we can measure elapsed time when they leave.
-# Not persisted - a bot restart just ends any sessions in progress.
-voice_sessions = {}
-
-
-def get_today_key() -> str:
-    return discord.utils.utcnow().date().isoformat()
-
-
-def get_guild_user_activity(guild_id: str, user_id: str) -> dict:
-    guild_bucket = activity.setdefault(guild_id, {})
-    return guild_bucket.setdefault(user_id, {"daily": {}})
-
-
-def get_today_bucket(guild_id: str, user_id: str) -> dict:
-    user_bucket = get_guild_user_activity(guild_id, user_id)
-    today_key = get_today_key()
-    return user_bucket["daily"].setdefault(
-        today_key,
-        {
-            "messages": 0,
-            "channels": {},
-            "voice_seconds": 0,
-            "voice_channels": {}
-        }
-    )
-
-
-def prune_old_activity(guild_id: str, user_id: str):
-    user_bucket = get_guild_user_activity(guild_id, user_id)
-    cutoff = discord.utils.utcnow().date() - timedelta(days=ACTIVITY_KEEP_DAYS)
-    daily = user_bucket["daily"]
-
-    for key in list(daily.keys()):
-        try:
-            day = datetime.fromisoformat(key).date()
-        except ValueError:
-            del daily[key]
-            continue
-
-        if day < cutoff:
-            del daily[key]
-
-
-def record_message(guild_id: str, user_id: str, channel_id: str):
-    bucket = get_today_bucket(guild_id, user_id)
-    bucket["messages"] += 1
-    bucket["channels"][channel_id] = bucket["channels"].get(channel_id, 0) + 1
-    prune_old_activity(guild_id, user_id)
-    save_activity(activity)
-
-
-def record_voice(guild_id: str, user_id: str, channel_id: str, seconds: float):
-    if seconds <= 0:
-        return
-
-    bucket = get_today_bucket(guild_id, user_id)
-    bucket["voice_seconds"] += seconds
-    bucket["voice_channels"][channel_id] = (
-        bucket["voice_channels"].get(channel_id, 0) + seconds
-    )
-    prune_old_activity(guild_id, user_id)
-    save_activity(activity)
-
-
-def get_window_stats(guild_id: str, user_id: str, days: int) -> dict:
-    """Totals for this user over the last `days` days, plus a per-channel
-    breakdown used to find their top text/voice channels."""
-    user_bucket = get_guild_user_activity(guild_id, user_id)
-    daily = user_bucket["daily"]
-    today = discord.utils.utcnow().date()
-
-    total_messages = 0
-    total_voice_seconds = 0.0
-    channels = {}
-    voice_channels = {}
-
-    for i in range(days):
-        key = (today - timedelta(days=i)).isoformat()
-        bucket = daily.get(key)
-        if not bucket:
-            continue
-
-        total_messages += bucket.get("messages", 0)
-        total_voice_seconds += bucket.get("voice_seconds", 0)
-
-        for channel_id, count in bucket.get("channels", {}).items():
-            channels[channel_id] = channels.get(channel_id, 0) + count
-
-        for channel_id, seconds in bucket.get("voice_channels", {}).items():
-            voice_channels[channel_id] = (
-                voice_channels.get(channel_id, 0) + seconds
-            )
-
-    return {
-        "messages": total_messages,
-        "voice_seconds": total_voice_seconds,
-        "channels": channels,
-        "voice_channels": voice_channels
-    }
-
-
-def get_daily_series(guild_id: str, user_id: str, days: int):
-    """Ordered (oldest -> newest) per-day message/voice-hours series,
-    used to draw the activity chart."""
-    user_bucket = get_guild_user_activity(guild_id, user_id)
-    daily = user_bucket["daily"]
-    today = discord.utils.utcnow().date()
-
-    dates = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]
-    messages = []
-    voice_hours = []
-
-    for day in dates:
-        bucket = daily.get(day.isoformat(), {})
-        messages.append(bucket.get("messages", 0))
-        voice_hours.append(round(bucket.get("voice_seconds", 0) / 3600, 2))
-
-    return dates, messages, voice_hours
-
-
-def get_top_channel(channel_totals: dict):
-    if not channel_totals:
-        return None, 0
-
-    top_id = max(channel_totals, key=channel_totals.get)
-    return top_id, channel_totals[top_id]
-
-
-def get_activity_rank(guild_id: str, metric: str, user_id: str, days: int):
-    """1-based rank of user_id among everyone in this guild with recorded
-    activity for the given metric ('messages' or 'voice'). Returns None
-    if the user has no recorded activity for that metric."""
-    guild_bucket = activity.get(guild_id, {})
-    totals = {}
-
-    for uid in guild_bucket:
-        stats = get_window_stats(guild_id, uid, days)
-        value = stats["messages"] if metric == "messages" else stats["voice_seconds"]
-        if value > 0:
-            totals[uid] = value
-
-    if user_id not in totals:
-        return None
-
-    ranked = sorted(totals, key=totals.get, reverse=True)
-    return ranked.index(user_id) + 1
-
-
-def format_hours(seconds: float) -> str:
-    hours = seconds / 3600
-    if hours == int(hours):
-        return f"{int(hours)} hours"
-    return f"{hours:.1f} hours"
-
-
-def build_activity_chart(guild_id: str, user_id: str, days: int = ACTIVITY_WINDOW_DAYS):
-    dates, messages, voice_hours = get_daily_series(guild_id, user_id, days)
-
-    if not any(messages) and not any(voice_hours):
-        return None
-
-    fig, ax = plt.subplots(figsize=(6, 2.2), dpi=150)
-    fig.patch.set_facecolor("#2b2d31")
-    ax.set_facecolor("#2b2d31")
-
-    ax.plot(dates, messages, color="#3ba55d", linewidth=2, label="Messages")
-    ax.plot(dates, voice_hours, color="#eb459e", linewidth=2, label="Voice (hrs)")
-
-    ax.tick_params(colors="#b5bac1", labelsize=7)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.grid(color="#3f4147", linewidth=0.5)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-    ax.legend(
-        loc="upper left",
-        facecolor="#2b2d31",
-        edgecolor="none",
-        labelcolor="#dbdee1",
-        fontsize=7
-    )
-    fig.autofmt_xdate(rotation=0, ha="center")
-
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
-
-    return discord.File(buf, filename="activity_chart.png")
-
-
-# -------------------------
 # BOT STARTUP
 # -------------------------
 
@@ -510,54 +289,6 @@ def build_activity_chart(guild_id: str, user_id: str, days: int = ACTIVITY_WINDO
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
-
-
-# -------------------------
-# ACTIVITY EVENTS (for /me)
-# -------------------------
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or message.guild is None:
-        await bot.process_commands(message)
-        return
-
-    record_message(
-        str(message.guild.id),
-        str(message.author.id),
-        str(message.channel.id)
-    )
-
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_voice_state_update(
-    member: discord.Member,
-    before: discord.VoiceState,
-    after: discord.VoiceState
-):
-    if member.bot:
-        return
-
-    guild_id = str(member.guild.id)
-    user_id = str(member.id)
-    key = (guild_id, user_id)
-    now = discord.utils.utcnow()
-
-    # Left a channel (including switching channels) - close out the
-    # session that was in progress and log the elapsed time.
-    if before.channel is not None and key in voice_sessions:
-        session = voice_sessions.pop(key)
-        elapsed = (now - session["start"]).total_seconds()
-        record_voice(guild_id, user_id, session["channel_id"], elapsed)
-
-    # Joined a channel (including switching channels) - start a new session.
-    if after.channel is not None:
-        voice_sessions[key] = {
-            "channel_id": str(after.channel.id),
-            "start": now
-        }
 
 
 # -------------------------
@@ -1802,125 +1533,6 @@ async def postrules(
 
 
 # -------------------------
-# ME (ACTIVITY STATS)
-# -------------------------
-
-@bot.tree.command(
-    name="me",
-    description="View your (or someone else's) server activity stats."
-)
-@app_commands.describe(
-    member="Whose stats to show (defaults to you)"
-)
-async def me(
-    interaction: discord.Interaction,
-    member: discord.Member = None
-):
-    target = member or interaction.user
-    guild_id = str(interaction.guild.id)
-    user_id = str(target.id)
-
-    await interaction.response.defer()
-
-    stats_1d = get_window_stats(guild_id, user_id, 1)
-    stats_7d = get_window_stats(guild_id, user_id, 7)
-    stats_14d = get_window_stats(guild_id, user_id, ACTIVITY_WINDOW_DAYS)
-
-    message_rank = get_activity_rank(
-        guild_id, "messages", user_id, ACTIVITY_WINDOW_DAYS
-    )
-    voice_rank = get_activity_rank(
-        guild_id, "voice", user_id, ACTIVITY_WINDOW_DAYS
-    )
-
-    top_channel_id, top_channel_count = get_top_channel(stats_14d["channels"])
-    top_voice_id, top_voice_seconds = get_top_channel(stats_14d["voice_channels"])
-
-    embed = discord.Embed(color=discord.Color.dark_theme())
-    embed.set_author(
-        name=f"{target.display_name}  ({target})",
-        icon_url=target.display_avatar.url
-    )
-    embed.set_thumbnail(url=target.display_avatar.url)
-
-    embed.add_field(
-        name="Created On",
-        value=target.created_at.strftime("%d %B %Y"),
-        inline=True
-    )
-    embed.add_field(
-        name="Joined On",
-        value=(
-            target.joined_at.strftime("%d %B %Y")
-            if isinstance(target, discord.Member) and target.joined_at
-            else "Unknown"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🏆 Server Ranks",
-        value=(
-            f"**Message:** {f'#{message_rank}' if message_rank else 'No Data'}\n"
-            f"**Voice:** {f'#{voice_rank}' if voice_rank else 'No Data'}"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="# Messages",
-        value=(
-            f"**1d:** {stats_1d['messages']} messages\n"
-            f"**7d:** {stats_7d['messages']} messages\n"
-            f"**14d:** {stats_14d['messages']} messages"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🔊 Voice Activity",
-        value=(
-            f"**1d:** {format_hours(stats_1d['voice_seconds'])}\n"
-            f"**7d:** {format_hours(stats_7d['voice_seconds'])}\n"
-            f"**14d:** {format_hours(stats_14d['voice_seconds'])}"
-        ),
-        inline=True
-    )
-
-    top_text_line = "No data"
-    if top_channel_id:
-        channel_obj = interaction.guild.get_channel(int(top_channel_id))
-        name = channel_obj.mention if channel_obj else f"#{top_channel_id}"
-        top_text_line = f"{name} — {top_channel_count} messages"
-
-    top_voice_line = "No data"
-    if top_voice_id:
-        channel_obj = interaction.guild.get_channel(int(top_voice_id))
-        name = channel_obj.mention if channel_obj else f"#{top_voice_id}"
-        top_voice_line = f"{name} — {format_hours(top_voice_seconds)}"
-
-    embed.add_field(
-        name="📈 Top Channels",
-        value=f"**Text:** {top_text_line}\n**Voice:** {top_voice_line}",
-        inline=False
-    )
-
-    chart_file = build_activity_chart(guild_id, user_id)
-    if chart_file:
-        embed.set_image(url="attachment://activity_chart.png")
-
-    embed.set_footer(
-        text=f"Server Lookback: Last {ACTIVITY_WINDOW_DAYS} days"
-    )
-    embed.timestamp = discord.utils.utcnow()
-
-    if chart_file:
-        await interaction.followup.send(embed=embed, file=chart_file)
-    else:
-        await interaction.followup.send(embed=embed)
-
-
-# -------------------------
 # COMMANDS LIST
 # -------------------------
 
@@ -1989,12 +1601,6 @@ async def commands_list(interaction: discord.Interaction):
             "`/postrules` — Post the rules & guidelines embed\n"
             "`/setrulesimage` — Set the rules embed image via URL"
         ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 Activity",
-        value="`/me` — View your (or someone else's) activity stats",
         inline=False
     )
 
