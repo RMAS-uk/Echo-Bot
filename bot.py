@@ -1412,64 +1412,6 @@ async def clear(
 
 
 # -------------------------
-# LOCK CHANNEL
-# -------------------------
-
-@bot.tree.command(
-    name="lock",
-    description="Lock the current channel."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def lock(interaction: discord.Interaction):
-
-    channel = interaction.channel
-
-    overwrite = channel.overwrites_for(
-        interaction.guild.default_role
-    )
-
-    overwrite.send_messages = False
-
-    await channel.set_permissions(
-        interaction.guild.default_role,
-        overwrite=overwrite
-    )
-
-    await interaction.response.send_message(
-        "🔒 This channel has been locked."
-    )
-
-
-# -------------------------
-# UNLOCK CHANNEL
-# -------------------------
-
-@bot.tree.command(
-    name="unlock",
-    description="Unlock the current channel."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def unlock(interaction: discord.Interaction):
-
-    channel = interaction.channel
-
-    overwrite = channel.overwrites_for(
-        interaction.guild.default_role
-    )
-
-    overwrite.send_messages = None
-
-    await channel.set_permissions(
-        interaction.guild.default_role,
-        overwrite=overwrite
-    )
-
-    await interaction.response.send_message(
-        "🔓 This channel has been unlocked."
-    )
-
-
-# -------------------------
 # RULES
 # -------------------------
 
@@ -1618,9 +1560,7 @@ async def commands_list(interaction: discord.Interaction):
             "`/warnings` — View a member's warnings\n"
             "`/viewwarnings` — View everyone with warnings server-wide\n"
             "`/clearwarnings` — Clear a member's warnings\n"
-            "`/clear` — Bulk delete messages\n"
-            "`/lock` — Lock the current channel\n"
-            "`/unlock` — Unlock the current channel"
+            "`/clear` — Bulk delete messages"
         ),
         inline=False
     )
