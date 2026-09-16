@@ -15,6 +15,7 @@ GUILD_ID = 1533843796834390116
 
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
+LEAVE_FILE = "leave_settings.json"
 RULES_FILE = "rules_settings.json"
 RULES_IMAGE_PATH = "rules.png"  # fallback local image, used if no URL is set
 
@@ -105,6 +106,84 @@ def save_welcome_settings(data):
 
 
 welcome_settings = load_welcome_settings()
+
+
+# -------------------------
+# LEAVE SETTINGS
+# -------------------------
+
+DEFAULT_LEAVE_MESSAGE = (
+    "☆・GOODBYE・☆\n"
+    "*.* ─────⋆⋅☆⋅⋆───── *.*\n\n"
+    "**{name}** has left {server}.\n\n"
+    "We hope to see you again!\n\n"
+    "*.* ─────⋆⋅☆⋅⋆───── *.*"
+)
+
+DEFAULT_LEAVE_IMAGE = None  # gif/image URL shown at the bottom of the embed
+
+
+def load_leave_settings():
+    if not os.path.exists(LEAVE_FILE):
+        return {}
+
+    try:
+        with open(LEAVE_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_leave_settings(data):
+    with open(LEAVE_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+
+leave_settings = load_leave_settings()
+
+
+def get_guild_leave_settings(guild_id: str):
+    """Return this guild's leave config, creating defaults if missing."""
+    if guild_id not in leave_settings:
+        leave_settings[guild_id] = {
+            "channel_id": None,
+            "message": DEFAULT_LEAVE_MESSAGE,
+            "image_url": DEFAULT_LEAVE_IMAGE,
+            "enabled": True
+        }
+        save_leave_settings(leave_settings)
+
+    return leave_settings[guild_id]
+
+
+def build_leave_embed(member: discord.Member, settings: dict) -> discord.Embed:
+    text = settings.get("message", DEFAULT_LEAVE_MESSAGE)
+
+    text = (
+        text.replace("{member}", member.mention)
+            .replace("{mention}", member.mention)
+            .replace("{name}", member.display_name)
+            .replace("{server}", member.guild.name)
+            .replace("{count}", str(member.guild.member_count))
+    )
+
+    embed = discord.Embed(
+        description=text,
+        color=discord.Color.dark_theme()
+    )
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    image_url = settings.get("image_url")
+    if image_url:
+        embed.set_image(url=image_url)
+
+    embed.set_footer(
+        text=f"{member.guild.member_count} members remaining."
+    )
+    embed.timestamp = discord.utils.utcnow()
+
+    return embed
 
 
 # -------------------------
@@ -239,6 +318,34 @@ async def on_member_join(member: discord.Member):
             content=f"Welcome, {member.mention}!",
             embed=embed
         )
+    except discord.Forbidden:
+        pass
+
+
+# -------------------------
+# LEAVE EVENT
+# -------------------------
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    guild_id = str(member.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    if not settings.get("enabled", True):
+        return
+
+    channel_id = settings.get("channel_id")
+    if not channel_id:
+        return
+
+    channel = member.guild.get_channel(channel_id)
+    if channel is None:
+        return
+
+    embed = build_leave_embed(member, settings)
+
+    try:
+        await channel.send(embed=embed)
     except discord.Forbidden:
         pass
 
@@ -531,6 +638,215 @@ async def welcome_settings_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Message",
         value=f"```{settings.get('message', DEFAULT_WELCOME_MESSAGE)}```",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# -------------------------
+# LEAVE: SET CHANNEL
+# -------------------------
+
+@bot.tree.command(
+    name="leave-setchannel",
+    description="Set the channel where leave messages are sent."
+)
+@app_commands.describe(
+    channel="The channel to send leave messages in"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_setchannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    settings["channel_id"] = channel.id
+    save_leave_settings(leave_settings)
+
+    await interaction.response.send_message(
+        f"✅ Leave messages will now be sent in {channel.mention}.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# LEAVE: SET MESSAGE
+# -------------------------
+
+@bot.tree.command(
+    name="leave-setmessage",
+    description="Set the leave message text."
+)
+@app_commands.describe(
+    message=(
+        "Leave text. Placeholders: {name} {server} {count}. "
+        "Use \\n for new lines."
+    )
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_setmessage(
+    interaction: discord.Interaction,
+    message: str
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    settings["message"] = message.replace("\\n", "\n")
+    save_leave_settings(leave_settings)
+
+    await interaction.response.send_message(
+        "✅ Leave message updated. Use `/leave-test` to preview it.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# LEAVE: SET IMAGE/GIF
+# -------------------------
+
+@bot.tree.command(
+    name="leave-setimage",
+    description="Set the image/gif shown at the bottom of the leave embed."
+)
+@app_commands.describe(
+    url="Direct URL to an image or gif (leave blank to remove it)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_setimage(
+    interaction: discord.Interaction,
+    url: str = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    settings["image_url"] = url
+    save_leave_settings(leave_settings)
+
+    if url:
+        await interaction.response.send_message(
+            "✅ Leave image/gif updated.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "✅ Leave image/gif removed.",
+            ephemeral=True
+        )
+
+
+# -------------------------
+# LEAVE: TOGGLE ON/OFF
+# -------------------------
+
+@bot.tree.command(
+    name="leave-toggle",
+    description="Enable or disable leave messages."
+)
+@app_commands.describe(
+    enabled="True to enable, False to disable"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_toggle(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    settings["enabled"] = enabled
+    save_leave_settings(leave_settings)
+
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(
+        f"✅ Leave messages are now **{state}**.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# LEAVE: RESET TO DEFAULT
+# -------------------------
+
+@bot.tree.command(
+    name="leave-reset",
+    description="Reset the leave message and image back to default."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_reset(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    settings["message"] = DEFAULT_LEAVE_MESSAGE
+    settings["image_url"] = DEFAULT_LEAVE_IMAGE
+    save_leave_settings(leave_settings)
+
+    await interaction.response.send_message(
+        "✅ Leave message and image/gif have been reset to default. "
+        "Your leave channel and enabled/disabled state were left "
+        "untouched. Use `/leave-test` to preview.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# LEAVE: TEST / PREVIEW
+# -------------------------
+
+@bot.tree.command(
+    name="leave-test",
+    description="Preview the current leave message."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_test(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    embed = build_leave_embed(interaction.user, settings)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# -------------------------
+# LEAVE: VIEW SETTINGS
+# -------------------------
+
+@bot.tree.command(
+    name="leave-settings",
+    description="View the current leave message configuration."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def leave_settings_cmd(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_leave_settings(guild_id)
+
+    channel_id = settings.get("channel_id")
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+
+    embed = discord.Embed(
+        title="Leave Message Settings",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Status",
+        value="Enabled ✅" if settings.get("enabled", True) else "Disabled ❌",
+        inline=True
+    )
+    embed.add_field(
+        name="Channel",
+        value=channel.mention if channel else "Not set",
+        inline=True
+    )
+    embed.add_field(
+        name="Image/GIF",
+        value=settings.get("image_url") or "Not set",
+        inline=False
+    )
+    embed.add_field(
+        name="Message",
+        value=f"```{settings.get('message', DEFAULT_LEAVE_MESSAGE)}```",
         inline=False
     )
 
@@ -1321,6 +1637,20 @@ async def commands_list(interaction: discord.Interaction):
             "`/welcome-test` — Preview the welcome message\n"
             "`/welcome-settings` — View current welcome config\n"
             "`/welcome-reset` — Reset welcome settings to default"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🚪 Leave Messages",
+        value=(
+            "`/leave-setchannel` — Set the leave channel\n"
+            "`/leave-setmessage` — Set the leave text\n"
+            "`/leave-setimage` — Set the leave gif/image\n"
+            "`/leave-toggle` — Enable/disable leave messages\n"
+            "`/leave-test` — Preview the leave message\n"
+            "`/leave-settings` — View current leave config\n"
+            "`/leave-reset` — Reset leave settings to default"
         ),
         inline=False
     )
