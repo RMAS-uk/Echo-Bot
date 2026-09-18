@@ -391,6 +391,44 @@ def build_command_log_embed(
 
 
 # -------------------------
+# JOIN ROLE SETTINGS
+# -------------------------
+
+JOINROLE_FILE = "joinrole_settings.json"
+
+
+def load_joinrole_settings():
+    if not os.path.exists(JOINROLE_FILE):
+        return {}
+
+    try:
+        with open(JOINROLE_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_joinrole_settings(data):
+    with open(JOINROLE_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+
+joinrole_settings = load_joinrole_settings()
+
+
+def get_guild_joinrole_settings(guild_id: str):
+    """Return this guild's join-role config, creating defaults if missing."""
+    if guild_id not in joinrole_settings:
+        joinrole_settings[guild_id] = {
+            "role_id": None,
+            "enabled": True
+        }
+        save_joinrole_settings(joinrole_settings)
+
+    return joinrole_settings[guild_id]
+
+
+# -------------------------
 # BOT STARTUP
 # -------------------------
 
@@ -448,7 +486,23 @@ async def on_app_command_completion(
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    # Auto-assign the configured join role, independent of welcome messages.
     guild_id = str(member.guild.id)
+    joinrole_config = get_guild_joinrole_settings(guild_id)
+
+    if joinrole_config.get("enabled", True):
+        role_id = joinrole_config.get("role_id")
+        role = member.guild.get_role(role_id) if role_id else None
+
+        if role is not None:
+            try:
+                await member.add_roles(
+                    role,
+                    reason="Auto-assigned join role"
+                )
+            except discord.Forbidden:
+                pass
+
     settings = get_guild_welcome_settings(guild_id)
 
     if not settings.get("enabled", True):
@@ -1690,6 +1744,122 @@ async def postrules(
 
 
 # -------------------------
+# JOIN ROLE: SET ROLE
+# -------------------------
+
+@bot.tree.command(
+    name="joinrole",
+    description="Set the role automatically given to everyone who joins the server."
+)
+@app_commands.describe(
+    role="The role to give new members"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def joinrole(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_joinrole_settings(guild_id)
+
+    if role.is_default():
+        await interaction.response.send_message(
+            "❌ You can't use @everyone as a join role.",
+            ephemeral=True
+        )
+        return
+
+    if role.managed:
+        await interaction.response.send_message(
+            "❌ That role is managed by an integration (e.g. a bot) and "
+            "can't be assigned manually.",
+            ephemeral=True
+        )
+        return
+
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "❌ I can't assign that role because it's higher than or "
+            "equal to my own top role. Move my role above it in "
+            "Server Settings → Roles.",
+            ephemeral=True
+        )
+        return
+
+    settings["role_id"] = role.id
+    settings["enabled"] = True
+    save_joinrole_settings(joinrole_settings)
+
+    await interaction.response.send_message(
+        f"✅ New members will now automatically receive the {role.mention} role.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# JOIN ROLE: TOGGLE ON/OFF
+# -------------------------
+
+@bot.tree.command(
+    name="joinrole-toggle",
+    description="Enable or disable automatically giving new members the join role."
+)
+@app_commands.describe(
+    enabled="True to enable, False to disable"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def joinrole_toggle(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_joinrole_settings(guild_id)
+
+    settings["enabled"] = enabled
+    save_joinrole_settings(joinrole_settings)
+
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(
+        f"✅ Auto join-role is now **{state}**.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# JOIN ROLE: VIEW SETTINGS
+# -------------------------
+
+@bot.tree.command(
+    name="joinrole-settings",
+    description="View the current join-role configuration."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def joinrole_settings_cmd(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_joinrole_settings(guild_id)
+
+    role_id = settings.get("role_id")
+    role = interaction.guild.get_role(role_id) if role_id else None
+
+    embed = discord.Embed(
+        title="Join Role Settings",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Status",
+        value="Enabled ✅" if settings.get("enabled", True) else "Disabled ❌",
+        inline=True
+    )
+    embed.add_field(
+        name="Role",
+        value=role.mention if role else "Not set",
+        inline=True
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# -------------------------
 # LOGS: SET CHANNEL
 # -------------------------
 
@@ -1827,6 +1997,16 @@ async def commands_list(interaction: discord.Interaction):
             "`/welcome-test` — Preview the welcome message\n"
             "`/welcome-settings` — View current welcome config\n"
             "`/welcome-reset` — Reset welcome settings to default"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎭 Join Role",
+        value=(
+            "`/joinrole` — Set the role given to new members\n"
+            "`/joinrole-toggle` — Enable/disable auto join-role\n"
+            "`/joinrole-settings` — View current join-role config"
         ),
         inline=False
     )
