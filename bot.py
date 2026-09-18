@@ -1354,6 +1354,9 @@ async def warn(
 
     await interaction.response.send_message("\n".join(response_lines))
 
+    sent_message = await interaction.original_response()
+    await sent_message.delete(delay=5)
+
 
 # -------------------------
 # VIEW WARNINGS
@@ -1529,6 +1532,9 @@ async def clear_warnings(
     await interaction.response.send_message(
         f"✅ Warnings for **{member}** have been cleared."
     )
+
+    sent_message = await interaction.original_response()
+    await sent_message.delete(delay=5)
 
 
 # -------------------------
