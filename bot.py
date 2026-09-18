@@ -1,7 +1,10 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
+import asyncio
+import random
+import re
 import json
 import os
 from dotenv import load_dotenv
@@ -53,6 +56,8 @@ class ModerationBot(commands.Bot):
 
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
+        self.add_view(GiveawayView())
+        await restore_giveaways()
 
         print("Slash commands synced.")
 
@@ -395,6 +400,215 @@ def build_command_log_embed(
 # -------------------------
 
 JOINROLE_FILE = "joinrole_settings.json"
+
+# -------------------------
+# GIVEAWAY SETTINGS
+# -------------------------
+
+GIVEAWAYS_FILE = "giveaways.json"
+
+
+def load_giveaways():
+    if not os.path.exists(GIVEAWAYS_FILE):
+        return {}
+
+    try:
+        with open(GIVEAWAYS_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_giveaways(data):
+    with open(GIVEAWAYS_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+
+giveaways = load_giveaways()
+
+
+def parse_giveaway_duration(value: str):
+    """Parse durations such as 30m, 1h, 2d, or 1w."""
+    match = re.fullmatch(r"\s*(\d+)\s*([smhdw])\s*", value.lower())
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    seconds = {
+        "s": amount,
+        "m": amount * 60,
+        "h": amount * 60 * 60,
+        "d": amount * 60 * 60 * 24,
+        "w": amount * 60 * 60 * 24 * 7,
+    }[unit]
+
+    if seconds <= 0 or seconds > 60 * 60 * 24 * 30:
+        return None
+
+    return seconds
+
+
+def build_giveaway_embed(data: dict, ended: bool = False) -> discord.Embed:
+    end_timestamp = int(datetime.fromisoformat(data["end_time"]).timestamp())
+
+    if ended:
+        title = "🎉 Giveaway Ended!"
+        color = discord.Color.dark_grey()
+        ends_text = f"Ended <t:{end_timestamp}:R>"
+    else:
+        title = "🎉 GIVEAWAY 🎉"
+        color = discord.Color.blurple()
+        ends_text = f"Ends <t:{end_timestamp}:R>"
+
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"**Prize:** {data['prize']}\n\n"
+            f"**Winners:** {data['winners']}\n"
+            f"**Entries:** {len(data.get('entries', []))}\n"
+            f"**{ends_text}**"
+        ),
+        color=color,
+        timestamp=discord.utils.utcnow()
+    )
+
+    embed.set_footer(text=f"Giveaway ID: {data['id']}")
+    return embed
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Enter Giveaway",
+        style=discord.ButtonStyle.primary,
+        emoji="🎉",
+        custom_id="giveaway:enter"
+    )
+    async def enter_giveaway(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        message_id = str(interaction.message.id)
+        data = giveaways.get(message_id)
+
+        if not data or data.get("ended"):
+            await interaction.response.send_message(
+                "❌ This giveaway has already ended.",
+                ephemeral=True
+            )
+            return
+
+        if datetime.now(timezone.utc) >= datetime.fromisoformat(data["end_time"]):
+            await end_giveaway(message_id)
+            await interaction.response.send_message(
+                "❌ This giveaway has already ended.",
+                ephemeral=True
+            )
+            return
+
+        user_id = interaction.user.id
+        entries = data.setdefault("entries", [])
+
+        if user_id in entries:
+            entries.remove(user_id)
+            save_giveaways(giveaways)
+            await interaction.response.send_message(
+                "↩️ You have left the giveaway.",
+                ephemeral=True
+            )
+        else:
+            entries.append(user_id)
+            save_giveaways(giveaways)
+            await interaction.response.send_message(
+                "🎉 You are entered! Good luck!",
+                ephemeral=True
+            )
+
+        try:
+            await interaction.message.edit(embed=build_giveaway_embed(data))
+        except discord.HTTPException:
+            pass
+
+
+def _giveaway_channel(data: dict):
+    guild = bot.get_guild(data["guild_id"])
+    if guild is None:
+        return None
+    return guild.get_channel(data["channel_id"])
+
+
+async def _disable_giveaway_button(message):
+    view = GiveawayView()
+    for item in view.children:
+        if isinstance(item, discord.ui.Button):
+            item.disabled = True
+    try:
+        await message.edit(view=view)
+    except discord.HTTPException:
+        pass
+
+
+async def end_giveaway(message_id: str, announce: bool = True):
+    data = giveaways.get(str(message_id))
+    if not data or data.get("ended"):
+        return False
+
+    data["ended"] = True
+    entries = list(dict.fromkeys(data.get("entries", [])))
+    winner_count = min(data["winners"], len(entries))
+    winner_ids = random.sample(entries, winner_count) if winner_count else []
+    data["winner_ids"] = winner_ids
+    save_giveaways(giveaways)
+
+    channel = _giveaway_channel(data)
+    if channel is None:
+        return True
+
+    try:
+        message = await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return True
+
+    await _disable_giveaway_button(message)
+    await message.edit(embed=build_giveaway_embed(data, ended=True))
+
+    if announce:
+        if winner_ids:
+            mentions = ", ".join(f"<@{user_id}>" for user_id in winner_ids)
+            content = (
+                f"🎉 Congratulations {mentions}! You won **{data['prize']}**!"
+            )
+        else:
+            content = "😔 No valid entries were received, so there is no winner."
+
+        try:
+            await channel.send(content)
+        except discord.Forbidden:
+            pass
+
+    return True
+
+
+async def schedule_giveaway_end(message_id: str):
+    data = giveaways.get(str(message_id))
+    if not data or data.get("ended"):
+        return
+
+    end_time = datetime.fromisoformat(data["end_time"])
+    delay = max(0, (end_time - datetime.now(timezone.utc)).total_seconds())
+    await asyncio.sleep(delay)
+    await end_giveaway(str(message_id))
+
+
+async def restore_giveaways():
+    for message_id, data in list(giveaways.items()):
+        if data.get("ended"):
+            continue
+        asyncio.create_task(schedule_giveaway_end(message_id))
 
 
 def load_joinrole_settings():
@@ -1953,6 +2167,195 @@ async def logs_settings_cmd(interaction: discord.Interaction):
 
 
 # -------------------------
+# GIVEAWAYS
+# -------------------------
+
+@bot.tree.command(
+    name="giveaway",
+    description="Create a giveaway with a button to enter."
+)
+@app_commands.describe(
+    prize="What is being given away",
+    duration="How long it lasts: 30m, 1h, 2d, or 1w",
+    winners="Number of winners (1-20)",
+    channel="Channel to post the giveaway in (defaults to this channel)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def giveaway(
+    interaction: discord.Interaction,
+    prize: str,
+    duration: str,
+    winners: app_commands.Range[int, 1, 20],
+    channel: discord.TextChannel = None
+):
+    seconds = parse_giveaway_duration(duration)
+    if seconds is None:
+        await interaction.response.send_message(
+            "❌ Invalid duration. Use something like `30m`, `1h`, `2d`, or `1w` (maximum 30 days).",
+            ephemeral=True
+        )
+        return
+
+    if not prize.strip():
+        await interaction.response.send_message(
+            "❌ The prize cannot be empty.",
+            ephemeral=True
+        )
+        return
+
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "❌ I can only post giveaways in a text channel.",
+            ephemeral=True
+        )
+        return
+
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+    # Reserve an ID using the message ID after sending; a temporary key keeps
+    # the data structure simple until Discord gives us the real message ID.
+    await interaction.response.defer(ephemeral=True)
+
+    temp_id = f"pending-{interaction.id}"
+    data = {
+        "id": temp_id,
+        "guild_id": interaction.guild.id,
+        "channel_id": target_channel.id,
+        "prize": prize.strip(),
+        "winners": int(winners),
+        "end_time": end_time.isoformat(),
+        "entries": [],
+        "winner_ids": [],
+        "ended": False,
+        "host_id": interaction.user.id
+    }
+
+    embed = build_giveaway_embed(data)
+
+    try:
+        message = await target_channel.send(
+            content="🎉 **GIVEAWAY!** 🎉",
+            embed=embed,
+            view=GiveawayView()
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ I don't have permission to post in that channel.",
+            ephemeral=True
+        )
+        return
+
+    message_id = str(message.id)
+    data["id"] = message_id
+    giveaways[message_id] = data
+    save_giveaways(giveaways)
+
+    # Update the embed now that the permanent giveaway ID is known.
+    await message.edit(embed=build_giveaway_embed(data))
+    asyncio.create_task(schedule_giveaway_end(message_id))
+
+    await interaction.followup.send(
+        f"✅ Giveaway created in {target_channel.mention}. It ends <t:{int(end_time.timestamp())}:R>.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="giveaway-end",
+    description="End an active giveaway immediately."
+)
+@app_commands.describe(
+    message_id="The message ID of the giveaway"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def giveaway_end(
+    interaction: discord.Interaction,
+    message_id: str
+):
+    if message_id not in giveaways:
+        await interaction.response.send_message(
+            "❌ I couldn't find that giveaway.",
+            ephemeral=True
+        )
+        return
+
+    if giveaways[message_id].get("ended"):
+        await interaction.response.send_message(
+            "❌ That giveaway has already ended.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    ended = await end_giveaway(message_id)
+
+    await interaction.followup.send(
+        "✅ Giveaway ended and the winner(s) have been selected." if ended
+        else "❌ I couldn't end that giveaway.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="giveaway-reroll",
+    description="Reroll the winner(s) of an ended giveaway."
+)
+@app_commands.describe(
+    message_id="The message ID of the ended giveaway"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def giveaway_reroll(
+    interaction: discord.Interaction,
+    message_id: str
+):
+    data = giveaways.get(message_id)
+
+    if not data:
+        await interaction.response.send_message(
+            "❌ I couldn't find that giveaway.",
+            ephemeral=True
+        )
+        return
+
+    if not data.get("ended"):
+        await interaction.response.send_message(
+            "❌ You can only reroll an ended giveaway.",
+            ephemeral=True
+        )
+        return
+
+    entries = list(dict.fromkeys(data.get("entries", [])))
+    previous_winners = set(data.get("winner_ids", []))
+    eligible = [user_id for user_id in entries if user_id not in previous_winners]
+
+    if not eligible:
+        await interaction.response.send_message(
+            "❌ There are no eligible entries left to reroll.",
+            ephemeral=True
+        )
+        return
+
+    new_winner = random.choice(eligible)
+    data["winner_ids"] = [new_winner]
+    save_giveaways(giveaways)
+
+    channel = _giveaway_channel(data)
+    if channel:
+        try:
+            await channel.send(
+                f"🎉 Reroll! Congratulations <@{new_winner}> — you won **{data['prize']}**!"
+            )
+        except discord.Forbidden:
+            pass
+
+    await interaction.response.send_message(
+        f"✅ Rerolled! New winner: <@{new_winner}>.",
+        ephemeral=True
+    )
+
+
+# -------------------------
 # COMMANDS LIST
 # -------------------------
 
@@ -1978,6 +2381,9 @@ COMMAND_CATEGORIES = [
     ], True),
     ("🧾 Logs", [
         "logschannel", "logs-toggle", "logs-settings"
+    ], True),
+    ("🎉 Giveaways", [
+        "giveaway", "giveaway-end", "giveaway-reroll"
     ], True),
     ("ℹ️ Other", [
         "commands"
