@@ -1956,109 +1956,82 @@ async def logs_settings_cmd(interaction: discord.Interaction):
 # COMMANDS LIST
 # -------------------------
 
+COMMAND_CATEGORIES = [
+    ("🛡️ Moderation", [
+        "kick", "ban", "unban", "timeout", "untimeout",
+        "warn", "warnings", "viewwarnings", "clearwarnings", "clear"
+    ], False),
+    ("👋 Welcome", [
+        "welcome-setchannel", "welcome-setmessage", "welcome-setimage",
+        "welcome-setruleschannel", "welcome-setsocials", "welcome-toggle",
+        "welcome-test", "welcome-settings", "welcome-reset"
+    ], True),
+    ("🚪 Leave", [
+        "leave-setchannel", "leave-setmessage", "leave-setimage",
+        "leave-toggle", "leave-test", "leave-settings", "leave-reset"
+    ], True),
+    ("🎭 Join Role", [
+        "joinrole", "joinrole-toggle", "joinrole-settings"
+    ], True),
+    ("📜 Rules", [
+        "postrules", "setrulesimage"
+    ], True),
+    ("🧾 Logs", [
+        "logschannel", "logs-toggle", "logs-settings"
+    ], True),
+    ("ℹ️ Other", [
+        "commands"
+    ], True),
+]
+
+
 @bot.tree.command(
     name="commands",
     description="Show a list of all available commands."
 )
 async def commands_list(interaction: discord.Interaction):
 
+    await interaction.response.defer(ephemeral=True)
+
+    # Pull the live, synced commands so we can build clickable /command
+    # mentions instead of plain code text - much easier to scan and tap.
+    try:
+        synced = await interaction.client.tree.fetch_commands(
+            guild=interaction.guild
+        )
+        command_ids = {command.name: command.id for command in synced}
+    except discord.HTTPException:
+        command_ids = {}
+
+    def mention(name: str) -> str:
+        command_id = command_ids.get(name)
+        return f"</{name}:{command_id}>" if command_id else f"`/{name}`"
+
     embed = discord.Embed(
         title="📖 Command List",
-        description="Here's everything I can do!",
+        description="Tap a command to run it, or type `/` to see its options.",
         color=discord.Color.blurple()
     )
 
-    embed.add_field(
-        name="🛡️ Moderation",
-        value=(
-            "`/kick` — Kick a member\n"
-            "`/ban` — Ban a member\n"
-            "`/unban` — Unban a user by ID\n"
-            "`/timeout` — Timeout a member\n"
-            "`/untimeout` — Remove a member's timeout\n"
-            "`/warn` — Warn a member\n"
-            "`/warnings` — View a member's warnings\n"
-            "`/viewwarnings` — View everyone with warnings server-wide\n"
-            "`/clearwarnings` — Clear a member's warnings\n"
-            "`/clear` — Bulk delete messages"
-        ),
-        inline=False
-    )
+    if interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
 
-    embed.add_field(
-        name="👋 Welcome Messages",
-        value=(
-            "`/welcome-setchannel` — Set the welcome channel\n"
-            "`/welcome-setmessage` — Set the welcome text\n"
-            "`/welcome-setimage` — Set the welcome gif/image\n"
-            "`/welcome-setruleschannel` — Set the {rules} channel link\n"
-            "`/welcome-setsocials` — Set your socials link\n"
-            "`/welcome-toggle` — Enable/disable welcome messages\n"
-            "`/welcome-test` — Preview the welcome message\n"
-            "`/welcome-settings` — View current welcome config\n"
-            "`/welcome-reset` — Reset welcome settings to default"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🎭 Join Role",
-        value=(
-            "`/joinrole` — Set the role given to new members\n"
-            "`/joinrole-toggle` — Enable/disable auto join-role\n"
-            "`/joinrole-settings` — View current join-role config"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🚪 Leave Messages",
-        value=(
-            "`/leave-setchannel` — Set the leave channel\n"
-            "`/leave-setmessage` — Set the leave text\n"
-            "`/leave-setimage` — Set the leave gif/image\n"
-            "`/leave-toggle` — Enable/disable leave messages\n"
-            "`/leave-test` — Preview the leave message\n"
-            "`/leave-settings` — View current leave config\n"
-            "`/leave-reset` — Reset leave settings to default"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📜 Rules",
-        value=(
-            "`/postrules` — Post the rules & guidelines embed\n"
-            "`/setrulesimage` — Set the rules embed image via URL"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🧾 Logs",
-        value=(
-            "`/logschannel` — Set the channel command usage is logged to\n"
-            "`/logs-toggle` — Enable/disable command logging\n"
-            "`/logs-settings` — View current logging config"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="ℹ️ Other",
-        value="`/commands` — Show this list",
-        inline=False
-    )
+    for category_name, command_names, inline in COMMAND_CATEGORIES:
+        embed.add_field(
+            name=category_name,
+            value="\n".join(mention(name) for name in command_names),
+            inline=inline
+        )
 
     embed.set_footer(
         text=(
-            "All commands require the Administrator permission. "
+            "All commands require the Administrator permission • "
             f"{WARNING_MUTE_THRESHOLD} warnings = auto-mute for "
-            f"{WARNING_MUTE_HOURS} hours."
+            f"{WARNING_MUTE_HOURS}h"
         )
     )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # -------------------------
