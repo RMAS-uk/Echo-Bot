@@ -17,10 +17,23 @@ WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
 LEAVE_FILE = "leave_settings.json"
 RULES_FILE = "rules_settings.json"
+LOGS_FILE = "logs_settings.json"
 RULES_IMAGE_PATH = "rules.png"  # fallback local image, used if no URL is set
 
 WARNING_MUTE_THRESHOLD = 3  # warnings needed before an auto-mute
 WARNING_MUTE_HOURS = 48     # length of that auto-mute
+
+# Commands considered "moderation" commands for the 🛡️ tag in the log embed.
+MODERATION_COMMANDS = {
+    "kick",
+    "ban",
+    "unban",
+    "timeout",
+    "untimeout",
+    "warn",
+    "clearwarnings",
+    "clear",
+}
 
 intents = discord.Intents.default()
 intents.members = True
@@ -282,6 +295,102 @@ def _ordinal_suffix(n: int) -> str:
 
 
 # -------------------------
+# LOGS SETTINGS
+# -------------------------
+
+def load_logs_settings():
+    if not os.path.exists(LOGS_FILE):
+        return {}
+
+    try:
+        with open(LOGS_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_logs_settings(data):
+    with open(LOGS_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+
+logs_settings = load_logs_settings()
+
+
+def get_guild_logs_settings(guild_id: str):
+    """Return this guild's command-log config, creating defaults if missing."""
+    if guild_id not in logs_settings:
+        logs_settings[guild_id] = {
+            "channel_id": None,
+            "enabled": True
+        }
+        save_logs_settings(logs_settings)
+
+    return logs_settings[guild_id]
+
+
+def _format_option_value(value) -> str:
+    """Turn a resolved slash-command option into readable text for the log embed."""
+    if isinstance(value, (discord.Member, discord.User)):
+        return f"{value.mention} (`{value.id}`)"
+    if isinstance(value, (discord.TextChannel, discord.VoiceChannel, discord.CategoryChannel, discord.Thread)):
+        return value.mention
+    if isinstance(value, discord.Role):
+        return value.mention
+    if value is None:
+        return "—"
+    return str(value)
+
+
+def build_command_log_embed(
+    interaction: discord.Interaction,
+    command: app_commands.Command
+) -> discord.Embed:
+    is_mod_command = command.qualified_name in MODERATION_COMMANDS
+
+    embed = discord.Embed(
+        title=f"{'🛡️ Moderation' if is_mod_command else '📖'} Command Used: /{command.qualified_name}",
+        color=discord.Color.red() if is_mod_command else discord.Color.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
+
+    embed.add_field(
+        name="User",
+        value=f"{interaction.user.mention} (`{interaction.user.id}`)",
+        inline=True
+    )
+
+    channel = interaction.channel
+    embed.add_field(
+        name="Channel",
+        value=channel.mention if channel else "Unknown",
+        inline=True
+    )
+
+    # interaction.namespace holds the resolved values the user actually typed/picked.
+    options = {}
+    try:
+        options = dict(interaction.namespace)
+    except Exception:
+        pass
+
+    if options:
+        formatted = "\n".join(
+            f"**{name}:** {_format_option_value(value)}"
+            for name, value in options.items()
+        )
+        embed.add_field(
+            name="Options",
+            value=formatted[:1024],
+            inline=False
+        )
+
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+    return embed
+
+
+# -------------------------
 # BOT STARTUP
 # -------------------------
 
@@ -289,6 +398,48 @@ def _ordinal_suffix(n: int) -> str:
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
+
+
+# -------------------------
+# COMMAND-USAGE LOGGING
+# -------------------------
+
+@bot.event
+async def on_app_command_completion(
+    interaction: discord.Interaction,
+    command: app_commands.Command
+):
+    """Fires automatically after ANY slash command runs successfully.
+
+    This logs every command (not just moderation ones) to the guild's
+    configured logs channel, so nothing needs to be added to individual
+    command functions.
+    """
+    if interaction.guild is None:
+        return
+
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_logs_settings(guild_id)
+
+    if not settings.get("enabled", True):
+        return
+
+    channel_id = settings.get("channel_id")
+    if not channel_id:
+        return
+
+    log_channel = interaction.guild.get_channel(channel_id)
+    if log_channel is None:
+        return
+
+    # Don't log the /logschannel-related commands landing in an infinite
+    # loop of noise, but do still log everything else, including /logs-settings.
+    embed = build_command_log_embed(interaction, command)
+
+    try:
+        await log_channel.send(embed=embed)
+    except discord.Forbidden:
+        pass
 
 
 # -------------------------
@@ -1533,6 +1684,99 @@ async def postrules(
 
 
 # -------------------------
+# LOGS: SET CHANNEL
+# -------------------------
+
+@bot.tree.command(
+    name="logschannel",
+    description="Set the channel where command usage logs are sent."
+)
+@app_commands.describe(
+    channel="The channel to send command logs in"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def logschannel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_logs_settings(guild_id)
+
+    settings["channel_id"] = channel.id
+    settings["enabled"] = True
+    save_logs_settings(logs_settings)
+
+    await interaction.response.send_message(
+        f"✅ Command logs (moderation actions and every other slash "
+        f"command used) will now be sent in {channel.mention}.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# LOGS: TOGGLE ON/OFF
+# -------------------------
+
+@bot.tree.command(
+    name="logs-toggle",
+    description="Enable or disable command usage logging."
+)
+@app_commands.describe(
+    enabled="True to enable, False to disable"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def logs_toggle(
+    interaction: discord.Interaction,
+    enabled: bool
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_logs_settings(guild_id)
+
+    settings["enabled"] = enabled
+    save_logs_settings(logs_settings)
+
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(
+        f"✅ Command usage logging is now **{state}**.",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# LOGS: VIEW SETTINGS
+# -------------------------
+
+@bot.tree.command(
+    name="logs-settings",
+    description="View the current command-logging configuration."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def logs_settings_cmd(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_logs_settings(guild_id)
+
+    channel_id = settings.get("channel_id")
+    channel = interaction.guild.get_channel(channel_id) if channel_id else None
+
+    embed = discord.Embed(
+        title="Command Log Settings",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Status",
+        value="Enabled ✅" if settings.get("enabled", True) else "Disabled ❌",
+        inline=True
+    )
+    embed.add_field(
+        name="Channel",
+        value=channel.mention if channel else "Not set",
+        inline=True
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# -------------------------
 # COMMANDS LIST
 # -------------------------
 
@@ -1600,6 +1844,16 @@ async def commands_list(interaction: discord.Interaction):
         value=(
             "`/postrules` — Post the rules & guidelines embed\n"
             "`/setrulesimage` — Set the rules embed image via URL"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧾 Logs",
+        value=(
+            "`/logschannel` — Set the channel command usage is logged to\n"
+            "`/logs-toggle` — Enable/disable command logging\n"
+            "`/logs-settings` — View current logging config"
         ),
         inline=False
     )
