@@ -2,8 +2,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import timedelta
+from collections import defaultdict
 import json
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv("/home/container/.env")
@@ -425,6 +427,257 @@ def get_guild_joinrole_settings(guild_id: str):
 
 
 # -------------------------
+# AUTOMOD SETTINGS
+# -------------------------
+
+AUTOMOD_FILE = "automod_settings.json"
+
+URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
+
+# In-memory sliding-window trackers: {guild_id: {user_id: [Message, ...]}}
+# Not persisted to disk on purpose - this is short-lived spam-window data,
+# not something that needs to survive a restart.
+link_spam_tracker = defaultdict(lambda: defaultdict(list))
+file_spam_tracker = defaultdict(lambda: defaultdict(list))
+mention_spam_tracker = defaultdict(lambda: defaultdict(list))
+
+
+def load_automod_settings():
+    if not os.path.exists(AUTOMOD_FILE):
+        return {}
+
+    try:
+        with open(AUTOMOD_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_automod_settings(data):
+    with open(AUTOMOD_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
+
+
+automod_settings = load_automod_settings()
+
+
+def get_guild_automod_settings(guild_id: str):
+    """Return this guild's automod config, creating defaults if missing."""
+    if guild_id not in automod_settings:
+        automod_settings[guild_id] = {
+            "link_spam": {
+                "enabled": True,
+                "max_count": 4,
+                "window_seconds": 10,
+                "action": "timeout",
+                "timeout_minutes": 10
+            },
+            "file_spam": {
+                "enabled": True,
+                "max_count": 4,
+                "window_seconds": 10,
+                "action": "timeout",
+                "timeout_minutes": 10
+            },
+            "mention_spam": {
+                "enabled": True,
+                "max_mentions_per_message": 5,
+                "max_count": 3,
+                "window_seconds": 10,
+                "action": "timeout",
+                "timeout_minutes": 10
+            },
+            "exempt_role_id": None
+        }
+        save_automod_settings(automod_settings)
+    else:
+        # Backfill any keys added after a guild's config already existed,
+        # so older saved configs don't crash on a missing category.
+        guild_cfg = automod_settings[guild_id]
+        changed = False
+
+        if "mention_spam" not in guild_cfg:
+            guild_cfg["mention_spam"] = {
+                "enabled": True,
+                "max_mentions_per_message": 5,
+                "max_count": 3,
+                "window_seconds": 10,
+                "action": "timeout",
+                "timeout_minutes": 10
+            }
+            changed = True
+
+        if "exempt_role_id" not in guild_cfg:
+            guild_cfg["exempt_role_id"] = None
+            changed = True
+
+        if changed:
+            save_automod_settings(automod_settings)
+
+    return automod_settings[guild_id]
+
+
+async def send_automod_log(
+    guild: discord.Guild,
+    label: str,
+    member: discord.Member,
+    removed_count: int,
+    action_taken: str
+):
+    """Reuses the existing /logschannel setup so automod hits and manual
+    command usage both land in the same place."""
+    settings = get_guild_logs_settings(str(guild.id))
+
+    if not settings.get("enabled", True):
+        return
+
+    channel_id = settings.get("channel_id")
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title=f"🚨 Automod: {label}",
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(
+        name="User",
+        value=f"{member.mention} (`{member.id}`)",
+        inline=True
+    )
+    embed.add_field(
+        name="Messages Removed",
+        value=str(removed_count),
+        inline=True
+    )
+    embed.add_field(
+        name="Action Taken",
+        value=action_taken,
+        inline=False
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
+
+async def enforce_automod_action(
+    offending_messages: list,
+    member,
+    cfg: dict,
+    label: str,
+    guild: discord.Guild
+):
+    """Deletes the given messages and applies the configured action
+    (delete only / timeout / kick), then reports it to the logs channel."""
+
+    for offending in offending_messages:
+        try:
+            await offending.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    action = cfg.get("action", "timeout")
+    action_taken = f"Deleted {len(offending_messages)} message(s)"
+
+    if action == "timeout" and isinstance(member, discord.Member) and member.moderatable:
+        minutes = cfg.get("timeout_minutes", 10)
+        try:
+            await member.timeout(
+                timedelta(minutes=minutes),
+                reason=f"Automod: {label}"
+            )
+            action_taken += f" + timed out {minutes}m"
+        except discord.Forbidden:
+            pass
+    elif action == "kick" and isinstance(member, discord.Member) and member.kickable:
+        try:
+            await member.kick(reason=f"Automod: {label}")
+            action_taken += " + kicked"
+        except discord.Forbidden:
+            pass
+
+    try:
+        await member.send(
+            f"⚠️ Your recent messages in **{guild.name}** were removed for **{label}**."
+        )
+    except discord.Forbidden:
+        pass
+
+    await send_automod_log(guild, label, member, len(offending_messages), action_taken)
+
+
+async def check_spam_window(
+    tracker: dict,
+    guild_id: int,
+    message: discord.Message,
+    cfg: dict,
+    label: str
+) -> bool:
+    """Adds this message to the user's rolling window for this spam type,
+    prunes anything outside the window, and - if the count crosses the
+    configured threshold - enforces the configured action. Returns True
+    if action was taken."""
+
+    now = discord.utils.utcnow()
+    window = timedelta(seconds=cfg.get("window_seconds", 10))
+    threshold = cfg.get("max_count", 4)
+
+    bucket = tracker[guild_id][message.author.id]
+    bucket.append(message)
+
+    bucket = [m for m in bucket if now - m.created_at <= window]
+    tracker[guild_id][message.author.id] = bucket
+
+    if len(bucket) < threshold:
+        return False
+
+    offending_messages = bucket
+    tracker[guild_id][message.author.id] = []
+
+    await enforce_automod_action(offending_messages, message.author, cfg, label, message.guild)
+    return True
+
+
+async def check_mention_spam(message: discord.Message, cfg: dict) -> bool:
+    """A single message with a large pile of mentions is spam on its own,
+    so this checks that first (instant trigger) before falling back to the
+    same sliding-window pattern used for link/file spam."""
+
+    total_mentions = len(message.mentions) + len(message.role_mentions)
+    if message.mention_everyone:
+        total_mentions += 1
+
+    if total_mentions == 0:
+        return False
+
+    max_per_message = cfg.get("max_mentions_per_message", 5)
+    if total_mentions >= max_per_message:
+        await enforce_automod_action(
+            [message],
+            message.author,
+            cfg,
+            "Mention Spam",
+            message.guild
+        )
+        return True
+
+    return await check_spam_window(
+        mention_spam_tracker,
+        message.guild.id,
+        message,
+        cfg,
+        "Mention Spam"
+    )
+
+
+# -------------------------
 # BOT STARTUP
 # -------------------------
 
@@ -484,6 +737,55 @@ async def on_app_command_completion(
         await log_channel.send(embed=embed)
     except discord.Forbidden:
         pass
+
+
+# -------------------------
+# AUTOMOD: MESSAGE SCANNING
+# -------------------------
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+
+    guild_id = str(message.guild.id)
+    settings = get_guild_automod_settings(guild_id)
+
+    if isinstance(message.author, discord.Member):
+        if message.author.guild_permissions.administrator:
+            return
+
+        exempt_role_id = settings.get("exempt_role_id")
+        if exempt_role_id and any(role.id == exempt_role_id for role in message.author.roles):
+            return
+
+    link_cfg = settings.get("link_spam", {})
+    if link_cfg.get("enabled", True) and message.content and URL_REGEX.search(message.content):
+        handled = await check_spam_window(
+            link_spam_tracker,
+            message.guild.id,
+            message,
+            link_cfg,
+            "Link Spam"
+        )
+        if handled:
+            return
+
+    file_cfg = settings.get("file_spam", {})
+    if file_cfg.get("enabled", True) and message.attachments:
+        handled = await check_spam_window(
+            file_spam_tracker,
+            message.guild.id,
+            message,
+            file_cfg,
+            "File Spam"
+        )
+        if handled:
+            return
+
+    mention_cfg = settings.get("mention_spam", {})
+    if mention_cfg.get("enabled", True):
+        await check_mention_spam(message, mention_cfg)
 
 
 # -------------------------
@@ -2163,6 +2465,271 @@ async def embed_command(interaction: discord.Interaction):
 
 
 # -------------------------
+# AUTOMOD: CONFIGURE LINK SPAM
+# -------------------------
+
+@bot.tree.command(
+    name="automod-linkspam",
+    description="Configure link-spam auto-moderation."
+)
+@app_commands.describe(
+    enabled="Turn link-spam detection on or off",
+    max_links="How many linked messages within the window counts as spam",
+    window_seconds="Time window in seconds to count messages within",
+    action="What to do besides deleting the messages",
+    timeout_minutes="Timeout length in minutes (only used if action is Timeout)"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Delete only", value="delete"),
+    app_commands.Choice(name="Delete + Timeout", value="timeout"),
+    app_commands.Choice(name="Delete + Kick", value="kick"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def automod_linkspam(
+    interaction: discord.Interaction,
+    enabled: bool,
+    max_links: app_commands.Range[int, 2, 20] = None,
+    window_seconds: app_commands.Range[int, 3, 120] = None,
+    action: app_commands.Choice[str] = None,
+    timeout_minutes: app_commands.Range[int, 1, 10080] = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_automod_settings(guild_id)
+    cfg = settings["link_spam"]
+
+    cfg["enabled"] = enabled
+    if max_links is not None:
+        cfg["max_count"] = max_links
+    if window_seconds is not None:
+        cfg["window_seconds"] = window_seconds
+    if action is not None:
+        cfg["action"] = action.value
+    if timeout_minutes is not None:
+        cfg["timeout_minutes"] = timeout_minutes
+
+    save_automod_settings(automod_settings)
+
+    summary = (
+        f"trigger: **{cfg['max_count']}** links within **{cfg['window_seconds']}s** → "
+        f"**{cfg['action']}**"
+    )
+    if cfg["action"] == "timeout":
+        summary += f" ({cfg['timeout_minutes']}m)"
+
+    await interaction.response.send_message(
+        f"✅ Link-spam detection is now **{'enabled' if enabled else 'disabled'}** "
+        f"({summary}).",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# AUTOMOD: CONFIGURE FILE SPAM
+# -------------------------
+
+@bot.tree.command(
+    name="automod-filespam",
+    description="Configure file/attachment-spam auto-moderation."
+)
+@app_commands.describe(
+    enabled="Turn file-spam detection on or off",
+    max_files="How many messages with attachments within the window counts as spam",
+    window_seconds="Time window in seconds to count messages within",
+    action="What to do besides deleting the messages",
+    timeout_minutes="Timeout length in minutes (only used if action is Timeout)"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Delete only", value="delete"),
+    app_commands.Choice(name="Delete + Timeout", value="timeout"),
+    app_commands.Choice(name="Delete + Kick", value="kick"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def automod_filespam(
+    interaction: discord.Interaction,
+    enabled: bool,
+    max_files: app_commands.Range[int, 2, 20] = None,
+    window_seconds: app_commands.Range[int, 3, 120] = None,
+    action: app_commands.Choice[str] = None,
+    timeout_minutes: app_commands.Range[int, 1, 10080] = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_automod_settings(guild_id)
+    cfg = settings["file_spam"]
+
+    cfg["enabled"] = enabled
+    if max_files is not None:
+        cfg["max_count"] = max_files
+    if window_seconds is not None:
+        cfg["window_seconds"] = window_seconds
+    if action is not None:
+        cfg["action"] = action.value
+    if timeout_minutes is not None:
+        cfg["timeout_minutes"] = timeout_minutes
+
+    save_automod_settings(automod_settings)
+
+    summary = (
+        f"trigger: **{cfg['max_count']}** file messages within **{cfg['window_seconds']}s** → "
+        f"**{cfg['action']}**"
+    )
+    if cfg["action"] == "timeout":
+        summary += f" ({cfg['timeout_minutes']}m)"
+
+    await interaction.response.send_message(
+        f"✅ File-spam detection is now **{'enabled' if enabled else 'disabled'}** "
+        f"({summary}).",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# AUTOMOD: CONFIGURE MENTION SPAM
+# -------------------------
+
+@bot.tree.command(
+    name="automod-mentionspam",
+    description="Configure mention-spam (mass ping) auto-moderation."
+)
+@app_commands.describe(
+    enabled="Turn mention-spam detection on or off",
+    max_mentions="Mentions in ONE message (users + roles + @everyone/@here) that trigger instantly",
+    max_messages="How many messages containing any mention within the window counts as spam",
+    window_seconds="Time window in seconds for the max_messages check",
+    action="What to do besides deleting the messages",
+    timeout_minutes="Timeout length in minutes (only used if action is Timeout)"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Delete only", value="delete"),
+    app_commands.Choice(name="Delete + Timeout", value="timeout"),
+    app_commands.Choice(name="Delete + Kick", value="kick"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def automod_mentionspam(
+    interaction: discord.Interaction,
+    enabled: bool,
+    max_mentions: app_commands.Range[int, 2, 50] = None,
+    max_messages: app_commands.Range[int, 2, 20] = None,
+    window_seconds: app_commands.Range[int, 3, 120] = None,
+    action: app_commands.Choice[str] = None,
+    timeout_minutes: app_commands.Range[int, 1, 10080] = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_automod_settings(guild_id)
+    cfg = settings["mention_spam"]
+
+    cfg["enabled"] = enabled
+    if max_mentions is not None:
+        cfg["max_mentions_per_message"] = max_mentions
+    if max_messages is not None:
+        cfg["max_count"] = max_messages
+    if window_seconds is not None:
+        cfg["window_seconds"] = window_seconds
+    if action is not None:
+        cfg["action"] = action.value
+    if timeout_minutes is not None:
+        cfg["timeout_minutes"] = timeout_minutes
+
+    save_automod_settings(automod_settings)
+
+    summary = (
+        f"instant trigger at **{cfg['max_mentions_per_message']}** mentions in one message, "
+        f"or **{cfg['max_count']}** mention-messages within **{cfg['window_seconds']}s** → "
+        f"**{cfg['action']}**"
+    )
+    if cfg["action"] == "timeout":
+        summary += f" ({cfg['timeout_minutes']}m)"
+
+    await interaction.response.send_message(
+        f"✅ Mention-spam detection is now **{'enabled' if enabled else 'disabled'}** "
+        f"({summary}).",
+        ephemeral=True
+    )
+
+
+# -------------------------
+# AUTOMOD: EXEMPT ROLE
+# -------------------------
+
+@bot.tree.command(
+    name="automod-exemptrole",
+    description="Set a role that bypasses automod checks (e.g. trusted members). Leave blank to clear it."
+)
+@app_commands.describe(
+    role="Role to exempt from automod (leave blank to remove the exemption)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def automod_exemptrole(
+    interaction: discord.Interaction,
+    role: discord.Role = None
+):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_automod_settings(guild_id)
+
+    settings["exempt_role_id"] = role.id if role else None
+    save_automod_settings(automod_settings)
+
+    if role:
+        await interaction.response.send_message(
+            f"✅ Members with {role.mention} will now bypass automod checks.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "✅ Automod exemption role cleared. Server administrators still "
+            "always bypass automod.",
+            ephemeral=True
+        )
+
+
+# -------------------------
+# AUTOMOD: VIEW SETTINGS
+# -------------------------
+
+@bot.tree.command(
+    name="automod-settings",
+    description="View the current automod configuration."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def automod_settings_cmd(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    settings = get_guild_automod_settings(guild_id)
+
+    embed = discord.Embed(
+        title="Automod Settings",
+        color=discord.Color.blurple()
+    )
+
+    for label, key in (
+        ("🔗 Link Spam", "link_spam"),
+        ("📎 File Spam", "file_spam"),
+        ("📣 Mention Spam", "mention_spam")
+    ):
+        cfg = settings[key]
+        value = (
+            f"Status: {'Enabled ✅' if cfg.get('enabled', True) else 'Disabled ❌'}\n"
+            f"Trigger: {cfg.get('max_count', 4)} in {cfg.get('window_seconds', 10)}s\n"
+        )
+        if key == "mention_spam":
+            value += f"Instant: {cfg.get('max_mentions_per_message', 5)} mentions/msg\n"
+        value += f"Action: {cfg.get('action', 'timeout')}"
+        if cfg.get("action") == "timeout":
+            value += f" ({cfg.get('timeout_minutes', 10)}m)"
+
+        embed.add_field(name=label, value=value, inline=True)
+
+    exempt_role_id = settings.get("exempt_role_id")
+    exempt_role = interaction.guild.get_role(exempt_role_id) if exempt_role_id else None
+
+    embed.add_field(
+        name="🛡️ Exempt Role",
+        value=exempt_role.mention if exempt_role else "None set",
+        inline=True
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# -------------------------
 # LOGS: SET CHANNEL
 # -------------------------
 
@@ -2281,6 +2848,10 @@ COMMAND_CATEGORIES = [
     ], True),
     ("🧾 Logs", [
         "logschannel", "logs-toggle", "logs-settings"
+    ], True),
+    ("🚨 Automod", [
+        "automod-linkspam", "automod-filespam", "automod-mentionspam",
+        "automod-exemptrole", "automod-settings"
     ], True),
     ("🧩 Embeds", [
         "embed"
