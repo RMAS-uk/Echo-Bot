@@ -10,9 +10,6 @@ load_dotenv("/home/container/.env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# CHANGE THIS to your Discord SERVER ID
-GUILD_ID = 1533843796834390116
-
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
 LEAVE_FILE = "leave_settings.json"
@@ -49,12 +46,11 @@ class ModerationBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        guild = discord.Object(id=GUILD_ID)
-
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
-
-        print("Slash commands synced.")
+        # Global sync makes commands available in every server the bot is
+        # in, but Discord can take up to ~1 hour to propagate a global sync
+        # everywhere. on_guild_join (below) covers new servers instantly.
+        await self.tree.sync()
+        print("Slash commands synced globally.")
 
 
 bot = ModerationBot()
@@ -436,6 +432,16 @@ def get_guild_joinrole_settings(guild_id: str):
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    # Copies the already-registered global commands into this specific
+    # guild's command cache so they show up immediately, instead of
+    # waiting for Discord's global command propagation.
+    bot.tree.copy_global_to(guild=guild)
+    await bot.tree.sync(guild=guild)
+    print(f"Joined new guild: {guild.name} ({guild.id}) — commands synced.")
 
 
 # -------------------------
