@@ -46,6 +46,7 @@ class ModerationBot(commands.Bot):
             command_prefix="!",
             intents=intents
         )
+        self.startup_sync_done = False
 
     async def setup_hook(self):
         # Global sync makes commands available in every server the bot is
@@ -685,6 +686,19 @@ async def check_mention_spam(message: discord.Message, cfg: dict) -> bool:
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
+
+    # A guild that got its commands via on_guild_join has its own frozen
+    # command list from that moment - a later global sync alone won't
+    # update it. Re-push into every guild we're already in on every
+    # startup so newly added commands (like /automod-*) actually show up
+    # without needing to wait on Discord's global propagation delay.
+    if not bot.startup_sync_done:
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+
+        bot.startup_sync_done = True
+        print(f"Re-synced commands instantly into {len(bot.guilds)} guild(s).")
 
 
 @bot.event
