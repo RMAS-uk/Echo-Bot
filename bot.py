@@ -15,9 +15,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
 LEAVE_FILE = "leave_settings.json"
-RULES_FILE = "rules_settings.json"
 LOGS_FILE = "logs_settings.json"
-RULES_IMAGE_PATH = "rules.png"  # fallback local image, used if no URL is set
 
 WARNING_MUTE_THRESHOLD = 3  # warnings needed before an auto-mute
 WARNING_MUTE_HOURS = 48     # length of that auto-mute
@@ -196,40 +194,6 @@ def build_leave_embed(member: discord.Member, settings: dict) -> discord.Embed:
     embed.timestamp = discord.utils.utcnow()
 
     return embed
-
-
-# -------------------------
-# RULES SETTINGS
-# -------------------------
-
-def load_rules_settings():
-    if not os.path.exists(RULES_FILE):
-        return {}
-
-    try:
-        with open(RULES_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_rules_settings(data):
-    with open(RULES_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
-
-
-rules_settings = load_rules_settings()
-
-
-def get_guild_rules_settings(guild_id: str):
-    """Return this guild's rules config, creating defaults if missing."""
-    if guild_id not in rules_settings:
-        rules_settings[guild_id] = {
-            "image_url": None
-        }
-        save_rules_settings(rules_settings)
-
-    return rules_settings[guild_id]
 
 
 def get_guild_welcome_settings(guild_id: str):
@@ -1944,126 +1908,6 @@ async def clear(
     )
 
 
-# -------------------------
-# RULES
-# -------------------------
-
-@bot.tree.command(
-    name="setrulesimage",
-    description="Set the image shown in the rules embed via a URL."
-)
-@app_commands.describe(
-    url="Direct URL to an image or gif (leave blank to use the local rules.png instead)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def setrulesimage(
-    interaction: discord.Interaction,
-    url: str = None
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_rules_settings(guild_id)
-
-    settings["image_url"] = url
-    save_rules_settings(rules_settings)
-
-    if url:
-        await interaction.response.send_message(
-            "✅ Rules image updated. Use `/postrules` to see it.",
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "✅ Rules image URL cleared. I'll fall back to the local "
-            "`rules.png` file if it exists.",
-            ephemeral=True
-        )
-
-
-@bot.tree.command(
-    name="postrules",
-    description="Post the server rules & guidelines embed."
-)
-@app_commands.describe(
-    channel="Channel to post the rules in (defaults to this channel)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def postrules(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel = None
-):
-    target_channel = channel or interaction.channel
-
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_rules_settings(guild_id)
-
-    embed = discord.Embed(
-        color=discord.Color.from_str("#5B1118"),
-        title="☆・RULES & GUIDELINES・☆",
-        description=(
-            "Please be sure to follow all rules and guidelines\n"
-            "to avoid being kicked from the server.\n\n"
-            "*+*─────☾ ♀ ⚜ ♂ ☽─────*+*\n\n"
-            "**1. Be respectful to everyone.** Treat all\n"
-            "members with kindness. No harassment,\n"
-            "hate speech, racism, or personal attacks.\n\n"
-            "**2. No spam or self-promotion.** Don't flood\n"
-            "chat, mass-ping, or advertise other servers\n"
-            "without permission.\n\n"
-            "**3. Use the right channels.** Post content where\n"
-            "it belongs and keep conversations on topic.\n\n"
-            "**4. No drama or witch-hunting.** Keep\n"
-            "disagreements civil and take serious issues\n"
-            "to a moderator.\n\n"
-            "**5. Listen to the staff team.** Moderators have\n"
-            "the final say. Don't argue with decisions in\n"
-            "public channels.\n\n"
-            "**6. Follow Discord's Terms of Service and\n"
-            "Community Guidelines at all times.**\n\n"
-            "**8. Be welcoming and have fun.** Help new\n"
-            "members feel at home.\n\n"
-            "*+*─────☾ ♀ ⚜ ♂ ☽─────*+*\n\n"
-            "By staying in this server, you agree to follow\n"
-            "these rules."
-        )
-    )
-
-    embed.set_footer(
-        text=(
-            "Rules created on "
-            f"{discord.utils.utcnow().strftime('%a, %b %d, %Y %I:%M %p')}"
-        )
-    )
-    embed.timestamp = discord.utils.utcnow()
-
-    image_url = settings.get("image_url")
-    file = None
-
-    if image_url:
-        # A URL was set with /setrulesimage - use it directly, no attachment needed.
-        embed.set_image(url=image_url)
-    elif os.path.exists(RULES_IMAGE_PATH):
-        # Fall back to a local rules.png sitting next to main.py.
-        file = discord.File(RULES_IMAGE_PATH, filename="rules.png")
-        embed.set_image(url="attachment://rules.png")
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        if file:
-            await target_channel.send(embed=embed, file=file)
-        else:
-            await target_channel.send(embed=embed)
-
-        await interaction.followup.send(
-            f"✅ Rules posted in {target_channel.mention}.",
-            ephemeral=True
-        )
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ I don't have permission to send messages in that channel.",
-            ephemeral=True
-        )
-
 
 # -------------------------
 # JOIN ROLE: SET ROLE
@@ -2856,9 +2700,6 @@ COMMAND_CATEGORIES = [
     ], True),
     ("🎭 Join Role", [
         "joinrole", "joinrole-toggle", "joinrole-settings"
-    ], True),
-    ("📜 Rules", [
-        "postrules", "setrulesimage"
     ], True),
     ("🧾 Logs", [
         "logschannel", "logs-toggle", "logs-settings"
