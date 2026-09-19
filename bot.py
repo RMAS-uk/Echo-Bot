@@ -2080,8 +2080,14 @@ class EmbedBuilderView(discord.ui.View):
         interaction: discord.Interaction,
         select: discord.ui.ChannelSelect
     ):
-        self.target_channel = select.values[0]
-        select.placeholder = f"Send to: #{self.target_channel.name}"
+        # ChannelSelect gives back a lightweight AppCommandChannel with no
+        # .send() - resolve it against the cache, falling back to an API
+        # fetch if it isn't cached yet, to get the real channel object.
+        picked = select.values[0]
+        channel = picked.resolve() or await picked.fetch()
+
+        self.target_channel = channel
+        select.placeholder = f"Send to: #{channel.name}"
         await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="Edit Text", emoji="✏️", style=discord.ButtonStyle.primary, row=1)
