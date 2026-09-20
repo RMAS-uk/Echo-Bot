@@ -30,6 +30,7 @@ MODERATION_COMMANDS = {
     "warn",
     "clearwarnings",
     "clear",
+    "giveroleall",
 }
 
 intents = discord.Intents.default()
@@ -1908,6 +1909,160 @@ async def clear(
     )
 
 
+# -------------------------
+# GIVE ROLE TO EVERYONE
+# -------------------------
+
+class GiveRoleAllConfirmView(discord.ui.View):
+    """Simple Confirm/Cancel gate in front of a mass role-grant, so a
+    stray tap/typo can't hand a role to the whole server."""
+
+    def __init__(self, author_id: int, role: discord.Role):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.role = role
+        self.confirmed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who ran this command can confirm it.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="Confirm", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"⏳ Giving {self.role.mention} to everyone, this can take a while for large servers...",
+            view=self
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", emoji="🗑️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="❌ Cancelled. No roles were changed.",
+            view=self
+        )
+        self.stop()
+
+
+@bot.tree.command(
+    name="giveroleall",
+    description="Give a role to every member currently in the server."
+)
+@app_commands.describe(
+    role="The role to give to everyone",
+    include_bots="Also give the role to bots (default: False)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def giveroleall(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    include_bots: bool = False
+):
+    if role.is_default():
+        await interaction.response.send_message(
+            "❌ You can't mass-assign @everyone.",
+            ephemeral=True
+        )
+        return
+
+    if role.managed:
+        await interaction.response.send_message(
+            "❌ That role is managed by an integration (e.g. a bot) and "
+            "can't be assigned manually.",
+            ephemeral=True
+        )
+        return
+
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "❌ I can't assign that role because it's higher than or "
+            "equal to my own top role. Move my role above it in "
+            "Server Settings → Roles.",
+            ephemeral=True
+        )
+        return
+
+    # Rough headcount for the confirmation prompt, based on the current
+    # member cache.
+    pending_count = sum(
+        1 for member in interaction.guild.members
+        if (include_bots or not member.bot) and role not in member.roles
+    )
+
+    if pending_count == 0:
+        await interaction.response.send_message(
+            f"✅ Everyone eligible already has {role.mention}. Nothing to do.",
+            ephemeral=True
+        )
+        return
+
+    view = GiveRoleAllConfirmView(
+        author_id=interaction.user.id,
+        role=role
+    )
+
+    await interaction.response.send_message(
+        f"⚠️ This will give {role.mention} to **{pending_count}** "
+        f"member(s) who don't already have it"
+        f"{' (bots included)' if include_bots else ' (bots excluded)'}. "
+        f"This isn't easily reversible in bulk — confirm?",
+        view=view,
+        ephemeral=True
+    )
+
+    timed_out = await view.wait()
+    if timed_out or not view.confirmed:
+        return
+
+    added = 0
+    skipped = 0
+    failed = 0
+
+    for member in interaction.guild.members:
+        if member.bot and not include_bots:
+            skipped += 1
+            continue
+
+        if role in member.roles:
+            skipped += 1
+            continue
+
+        try:
+            await member.add_roles(
+                role,
+                reason=f"/giveroleall run by {interaction.user}"
+            )
+            added += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    summary = (
+        f"✅ Gave {role.mention} to **{added}** member(s).\n"
+        f"Skipped **{skipped}** (already had it or excluded).\n"
+    )
+    if failed:
+        summary += (
+            f"⚠️ Failed on **{failed}** member(s) "
+            f"(missing permissions or role hierarchy)."
+        )
+
+    await interaction.followup.send(summary, ephemeral=True)
+
 
 # -------------------------
 # JOIN ROLE: SET ROLE
@@ -2687,7 +2842,8 @@ async def logs_settings_cmd(interaction: discord.Interaction):
 COMMAND_CATEGORIES = [
     ("🛡️ Moderation", [
         "kick", "ban", "unban", "timeout", "untimeout",
-        "warn", "warnings", "viewwarnings", "clearwarnings", "clear"
+        "warn", "warnings", "viewwarnings", "clearwarnings", "clear",
+        "giveroleall"
     ], False),
     ("👋 Welcome", [
         "welcome-setchannel", "welcome-setmessage", "welcome-setimage",
