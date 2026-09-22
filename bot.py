@@ -791,297 +791,272 @@ async def on_member_remove(member: discord.Member):
 
 
 # -------------------------
-# WELCOME: SET CHANNEL
+# WELCOME: INTERACTIVE PANEL
 # -------------------------
+#
+# One command (/welcome) instead of nine. Everything - channel, rules
+# channel, message, image, socials, on/off, reset, and a live preview -
+# lives in a single panel, the same pattern as /embed.
 
-@bot.tree.command(
-    name="welcome-setchannel",
-    description="Set the channel where welcome messages are sent."
-)
-@app_commands.describe(
-    channel="The channel to send welcome messages in"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_setchannel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    settings["channel_id"] = channel.id
-    save_welcome_settings(welcome_settings)
-
-    await interaction.response.send_message(
-        f"✅ Welcome messages will now be sent in {channel.mention}.",
-        ephemeral=True
+class WelcomeMessageModal(discord.ui.Modal, title="Welcome Message"):
+    message = discord.ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        max_length=4000
     )
 
+    def __init__(self, view: "WelcomePanelView"):
+        super().__init__()
+        self.view = view
+        self.message.default = view.settings.get("message", DEFAULT_WELCOME_MESSAGE)
 
-# -------------------------
-# WELCOME: SET MESSAGE
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-setmessage",
-    description="Set the welcome message text."
-)
-@app_commands.describe(
-    message=(
-        "Welcome text. Placeholders: {member} {name} {server} {count} "
-        "{rules} {socials}. Use \\n for new lines."
-    )
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_setmessage(
-    interaction: discord.Interaction,
-    message: str
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    # allow literal \n typed by the user to become real newlines
-    settings["message"] = message.replace("\\n", "\n")
-    save_welcome_settings(welcome_settings)
-
-    await interaction.response.send_message(
-        "✅ Welcome message updated. Use `/welcome-test` to preview it.",
-        ephemeral=True
-    )
-
-
-# -------------------------
-# WELCOME: SET IMAGE/GIF
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-setimage",
-    description="Set the image/gif shown at the bottom of the welcome embed."
-)
-@app_commands.describe(
-    url="Direct URL to an image or gif (leave blank to remove it)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_setimage(
-    interaction: discord.Interaction,
-    url: str = None
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    settings["image_url"] = url
-    save_welcome_settings(welcome_settings)
-
-    if url:
-        await interaction.response.send_message(
-            "✅ Welcome image/gif updated.",
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "✅ Welcome image/gif removed.",
-            ephemeral=True
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view.settings["message"] = self.message.value.replace("\\n", "\n")
+        save_welcome_settings(welcome_settings)
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_preview(interaction.user),
+            view=self.view
         )
 
 
-# -------------------------
-# WELCOME: SET RULES CHANNEL
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-setruleschannel",
-    description="Set the channel linked wherever {rules} is used in the welcome message."
-)
-@app_commands.describe(
-    channel="The channel to link (e.g. your #rules channel)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_setruleschannel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    settings["rules_channel_id"] = channel.id
-    save_welcome_settings(welcome_settings)
-
-    await interaction.response.send_message(
-        f"✅ {channel.mention} will now show up anywhere your welcome "
-        f"message uses `{{rules}}`.",
-        ephemeral=True
+class WelcomeImageModal(discord.ui.Modal, title="Welcome Image / GIF"):
+    image_url = discord.ui.TextInput(
+        label="Image/GIF URL (leave blank to remove)",
+        required=False
     )
 
+    def __init__(self, view: "WelcomePanelView"):
+        super().__init__()
+        self.view = view
+        current = view.settings.get("image_url")
+        if current:
+            self.image_url.default = current
 
-# -------------------------
-# WELCOME: SET SOCIALS
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-setsocials",
-    description="Set your socials link used in the {socials} placeholder."
-)
-@app_commands.describe(
-    url="Link to your socials (leave blank to remove it)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_setsocials(
-    interaction: discord.Interaction,
-    url: str = None
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    settings["socials"] = url
-    save_welcome_settings(welcome_settings)
-
-    if url:
-        await interaction.response.send_message(
-            f"✅ Socials link set to {url}. It'll show up anywhere your "
-            f"welcome message uses `{{socials}}`.",
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "✅ Socials link removed.",
-            ephemeral=True
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view.settings["image_url"] = self.image_url.value or None
+        save_welcome_settings(welcome_settings)
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_preview(interaction.user),
+            view=self.view
         )
 
 
-# -------------------------
-# WELCOME: TOGGLE ON/OFF
-# -------------------------
+class WelcomeSocialsModal(discord.ui.Modal, title="Socials Link"):
+    socials = discord.ui.TextInput(
+        label="Socials URL (leave blank to remove)",
+        required=False
+    )
+
+    def __init__(self, view: "WelcomePanelView"):
+        super().__init__()
+        self.view = view
+        current = view.settings.get("socials")
+        if current:
+            self.socials.default = current
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view.settings["socials"] = self.socials.value or None
+        save_welcome_settings(welcome_settings)
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_preview(interaction.user),
+            view=self.view
+        )
+
+
+class WelcomePanelView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, settings: dict, author_id: int):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.settings = settings
+        self.author_id = author_id
+
+        channel_id = settings.get("channel_id")
+        channel = guild.get_channel(channel_id) if channel_id else None
+        self.channel_select.placeholder = (
+            f"Welcome channel: #{channel.name}" if channel else "Welcome channel: not set"
+        )
+
+        rules_channel_id = settings.get("rules_channel_id")
+        rules_channel = guild.get_channel(rules_channel_id) if rules_channel_id else None
+        self.rules_select.placeholder = (
+            f"Rules channel: #{rules_channel.name}" if rules_channel else "Rules channel: not set"
+        )
+
+        self._sync_toggle_button()
+
+    def _sync_toggle_button(self):
+        enabled = self.settings.get("enabled", True)
+        self.toggle_button.label = "Disable" if enabled else "Enable"
+        self.toggle_button.emoji = "🔕" if enabled else "🔔"
+        self.toggle_button.style = (
+            discord.ButtonStyle.secondary if enabled else discord.ButtonStyle.success
+        )
+
+    def panel_content(self) -> str:
+        status = "Enabled ✅" if self.settings.get("enabled", True) else "Disabled ❌"
+        return (
+            f"**Welcome Panel** — Status: {status}\n"
+            f"Pick channels and use the buttons below to edit everything else. "
+            f"The preview below updates as you go."
+        )
+
+    def build_preview(self, member: discord.Member) -> discord.Embed:
+        return build_welcome_embed(member, self.settings)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who opened this panel can use its controls.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Welcome channel",
+        row=0
+    )
+    async def channel_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.ChannelSelect
+    ):
+        picked = select.values[0]
+        channel = picked.resolve() or await picked.fetch()
+
+        self.settings["channel_id"] = channel.id
+        save_welcome_settings(welcome_settings)
+        select.placeholder = f"Welcome channel: #{channel.name}"
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Rules channel",
+        row=1
+    )
+    async def rules_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.ChannelSelect
+    ):
+        picked = select.values[0]
+        channel = picked.resolve() or await picked.fetch()
+
+        self.settings["rules_channel_id"] = channel.id
+        save_welcome_settings(welcome_settings)
+        select.placeholder = f"Rules channel: #{channel.name}"
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.button(label="Edit Message", emoji="✏️", style=discord.ButtonStyle.primary, row=2)
+    async def edit_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WelcomeMessageModal(self))
+
+    @discord.ui.button(label="Set Image", emoji="🖼️", style=discord.ButtonStyle.secondary, row=2)
+    async def set_image_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WelcomeImageModal(self))
+
+    @discord.ui.button(label="Set Socials", emoji="🔗", style=discord.ButtonStyle.secondary, row=2)
+    async def set_socials_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WelcomeSocialsModal(self))
+
+    @discord.ui.button(label="Disable", emoji="🔕", style=discord.ButtonStyle.secondary, row=3)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["enabled"] = not self.settings.get("enabled", True)
+        save_welcome_settings(welcome_settings)
+        self._sync_toggle_button()
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.button(label="Reset to Default", emoji="♻️", style=discord.ButtonStyle.danger, row=3)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["message"] = DEFAULT_WELCOME_MESSAGE
+        self.settings["image_url"] = DEFAULT_WELCOME_IMAGE
+        self.settings["socials"] = DEFAULT_WELCOME_SOCIALS
+        save_welcome_settings(welcome_settings)
+
+        await interaction.response.edit_message(
+            content=self.panel_content() + "\n♻️ Message, image, and socials reset to default.",
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.button(label="Send Test", emoji="📨", style=discord.ButtonStyle.success, row=4)
+    async def send_test_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.channel.send(
+                content=f"Welcome, {interaction.user.mention}!",
+                embed=self.build_preview(interaction.user)
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I don't have permission to send messages in this channel.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "✅ Test welcome message sent to this channel.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Close", emoji="✅", style=discord.ButtonStyle.secondary, row=4)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="✅ Welcome panel closed. Your settings are saved.",
+            view=self
+        )
+        self.stop()
+
 
 @bot.tree.command(
-    name="welcome-toggle",
-    description="Enable or disable welcome messages."
-)
-@app_commands.describe(
-    enabled="True to enable, False to disable"
+    name="welcome",
+    description="Open an interactive panel to configure welcome messages."
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def welcome_toggle(
-    interaction: discord.Interaction,
-    enabled: bool
-):
+async def welcome_command(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     settings = get_guild_welcome_settings(guild_id)
 
-    settings["enabled"] = enabled
-    save_welcome_settings(welcome_settings)
+    view = WelcomePanelView(
+        guild=interaction.guild,
+        settings=settings,
+        author_id=interaction.user.id
+    )
 
-    state = "enabled" if enabled else "disabled"
     await interaction.response.send_message(
-        f"✅ Welcome messages are now **{state}**.",
+        content=view.panel_content(),
+        embed=view.build_preview(interaction.user),
+        view=view,
         ephemeral=True
     )
 
-
-# -------------------------
-# WELCOME: RESET TO DEFAULT
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-reset",
-    description="Reset the welcome message, image, and socials back to default."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_reset(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    settings["message"] = DEFAULT_WELCOME_MESSAGE
-    settings["image_url"] = DEFAULT_WELCOME_IMAGE
-    settings["socials"] = DEFAULT_WELCOME_SOCIALS
-    save_welcome_settings(welcome_settings)
-
-    await interaction.response.send_message(
-        "✅ Welcome message, image/gif, and socials have been reset to "
-        "default. Your welcome channel and enabled/disabled state were "
-        "left untouched. Use `/welcome-test` to preview.",
-        ephemeral=True
-    )
-
-
-# -------------------------
-# WELCOME: TEST / PREVIEW
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-test",
-    description="Preview the current welcome message."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_test(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    embed = build_welcome_embed(interaction.user, settings)
-
-    await interaction.response.send_message(
-        content=f"Welcome, {interaction.user.mention}!",
-        embed=embed
-    )
-
-
-# -------------------------
-# WELCOME: VIEW SETTINGS
-# -------------------------
-
-@bot.tree.command(
-    name="welcome-settings",
-    description="View the current welcome message configuration."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def welcome_settings_cmd(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_welcome_settings(guild_id)
-
-    channel_id = settings.get("channel_id")
-    channel = interaction.guild.get_channel(channel_id) if channel_id else None
-
-    rules_channel_id = settings.get("rules_channel_id")
-    rules_channel = (
-        interaction.guild.get_channel(rules_channel_id)
-        if rules_channel_id else None
-    )
-
-    embed = discord.Embed(
-        title="Welcome Message Settings",
-        color=discord.Color.blurple()
-    )
-    embed.add_field(
-        name="Status",
-        value="Enabled ✅" if settings.get("enabled", True) else "Disabled ❌",
-        inline=True
-    )
-    embed.add_field(
-        name="Channel",
-        value=channel.mention if channel else "Not set",
-        inline=True
-    )
-    embed.add_field(
-        name="Rules Channel",
-        value=rules_channel.mention if rules_channel else "Not set",
-        inline=True
-    )
-    embed.add_field(
-        name="Image/GIF",
-        value=settings.get("image_url") or "Not set",
-        inline=False
-    )
-    embed.add_field(
-        name="Socials",
-        value=settings.get("socials") or "Not set",
-        inline=False
-    )
-    embed.add_field(
-        name="Message",
-        value=f"```{settings.get('message', DEFAULT_WELCOME_MESSAGE)}```",
-        inline=False
-    )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # -------------------------
@@ -2573,9 +2548,7 @@ COMMAND_CATEGORIES = [
         "giveroleall"
     ], False),
     ("👋 Welcome", [
-        "welcome-setchannel", "welcome-setmessage", "welcome-setimage",
-        "welcome-setruleschannel", "welcome-setsocials", "welcome-toggle",
-        "welcome-test", "welcome-settings", "welcome-reset"
+        "welcome"
     ], True),
     ("🚪 Leave", [
         "leave-setchannel", "leave-setmessage", "leave-setimage",
