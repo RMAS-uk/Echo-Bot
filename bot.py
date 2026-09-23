@@ -1017,214 +1017,211 @@ async def welcome_command(interaction: discord.Interaction):
     )
 
 
-
 # -------------------------
-# LEAVE: SET CHANNEL
+# LEAVE: INTERACTIVE PANEL
 # -------------------------
+#
+# One command (/leave) instead of seven, same pattern as /welcome and
+# /embed: channel, message, image, on/off, reset, and a live preview all
+# live in a single panel.
 
-@bot.tree.command(
-    name="leave-setchannel",
-    description="Set the channel where leave messages are sent."
-)
-@app_commands.describe(
-    channel="The channel to send leave messages in"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def leave_setchannel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_leave_settings(guild_id)
-
-    settings["channel_id"] = channel.id
-    save_leave_settings(leave_settings)
-
-    await interaction.response.send_message(
-        f"✅ Leave messages will now be sent in {channel.mention}.",
-        ephemeral=True
+class LeaveMessageModal(discord.ui.Modal, title="Leave Message"):
+    message = discord.ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        max_length=4000
     )
 
+    def __init__(self, view: "LeavePanelView"):
+        super().__init__()
+        self.view = view
+        self.message.default = view.settings.get("message", DEFAULT_LEAVE_MESSAGE)
 
-# -------------------------
-# LEAVE: SET MESSAGE
-# -------------------------
-
-@bot.tree.command(
-    name="leave-setmessage",
-    description="Set the leave message text."
-)
-@app_commands.describe(
-    message=(
-        "Leave text. Placeholders: {name} {server} {count}. "
-        "Use \\n for new lines."
-    )
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def leave_setmessage(
-    interaction: discord.Interaction,
-    message: str
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_leave_settings(guild_id)
-
-    settings["message"] = message.replace("\\n", "\n")
-    save_leave_settings(leave_settings)
-
-    await interaction.response.send_message(
-        "✅ Leave message updated. Use `/leave-test` to preview it.",
-        ephemeral=True
-    )
-
-
-# -------------------------
-# LEAVE: SET IMAGE/GIF
-# -------------------------
-
-@bot.tree.command(
-    name="leave-setimage",
-    description="Set the image/gif shown at the bottom of the leave embed."
-)
-@app_commands.describe(
-    url="Direct URL to an image or gif (leave blank to remove it)"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def leave_setimage(
-    interaction: discord.Interaction,
-    url: str = None
-):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_leave_settings(guild_id)
-
-    settings["image_url"] = url
-    save_leave_settings(leave_settings)
-
-    if url:
-        await interaction.response.send_message(
-            "✅ Leave image/gif updated.",
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "✅ Leave image/gif removed.",
-            ephemeral=True
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view.settings["message"] = self.message.value.replace("\\n", "\n")
+        save_leave_settings(leave_settings)
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_preview(interaction.user),
+            view=self.view
         )
 
 
-# -------------------------
-# LEAVE: TOGGLE ON/OFF
-# -------------------------
+class LeaveImageModal(discord.ui.Modal, title="Leave Image / GIF"):
+    image_url = discord.ui.TextInput(
+        label="Image/GIF URL (leave blank to remove)",
+        required=False
+    )
+
+    def __init__(self, view: "LeavePanelView"):
+        super().__init__()
+        self.view = view
+        current = view.settings.get("image_url")
+        if current:
+            self.image_url.default = current
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view.settings["image_url"] = self.image_url.value or None
+        save_leave_settings(leave_settings)
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_preview(interaction.user),
+            view=self.view
+        )
+
+
+class LeavePanelView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, settings: dict, author_id: int):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.settings = settings
+        self.author_id = author_id
+
+        channel_id = settings.get("channel_id")
+        channel = guild.get_channel(channel_id) if channel_id else None
+        self.channel_select.placeholder = (
+            f"Leave channel: #{channel.name}" if channel else "Leave channel: not set"
+        )
+
+        self._sync_toggle_button()
+
+    def _sync_toggle_button(self):
+        enabled = self.settings.get("enabled", True)
+        self.toggle_button.label = "Disable" if enabled else "Enable"
+        self.toggle_button.emoji = "🔕" if enabled else "🔔"
+        self.toggle_button.style = (
+            discord.ButtonStyle.secondary if enabled else discord.ButtonStyle.success
+        )
+
+    def panel_content(self) -> str:
+        status = "Enabled ✅" if self.settings.get("enabled", True) else "Disabled ❌"
+        return (
+            f"**Leave Panel** — Status: {status}\n"
+            f"Pick a channel and use the buttons below to edit everything else. "
+            f"The preview below updates as you go."
+        )
+
+    def build_preview(self, member: discord.Member) -> discord.Embed:
+        return build_leave_embed(member, self.settings)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who opened this panel can use its controls.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Leave channel",
+        row=0
+    )
+    async def channel_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.ChannelSelect
+    ):
+        picked = select.values[0]
+        channel = picked.resolve() or await picked.fetch()
+
+        self.settings["channel_id"] = channel.id
+        save_leave_settings(leave_settings)
+        select.placeholder = f"Leave channel: #{channel.name}"
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.button(label="Edit Message", emoji="✏️", style=discord.ButtonStyle.primary, row=1)
+    async def edit_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LeaveMessageModal(self))
+
+    @discord.ui.button(label="Set Image", emoji="🖼️", style=discord.ButtonStyle.secondary, row=1)
+    async def set_image_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LeaveImageModal(self))
+
+    @discord.ui.button(label="Disable", emoji="🔕", style=discord.ButtonStyle.secondary, row=2)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["enabled"] = not self.settings.get("enabled", True)
+        save_leave_settings(leave_settings)
+        self._sync_toggle_button()
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.button(label="Reset to Default", emoji="♻️", style=discord.ButtonStyle.danger, row=2)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["message"] = DEFAULT_LEAVE_MESSAGE
+        self.settings["image_url"] = DEFAULT_LEAVE_IMAGE
+        save_leave_settings(leave_settings)
+
+        await interaction.response.edit_message(
+            content=self.panel_content() + "\n♻️ Message and image reset to default.",
+            embed=self.build_preview(interaction.user),
+            view=self
+        )
+
+    @discord.ui.button(label="Send Test", emoji="📨", style=discord.ButtonStyle.success, row=3)
+    async def send_test_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.channel.send(embed=self.build_preview(interaction.user))
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I don't have permission to send messages in this channel.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "✅ Test leave message sent to this channel.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Close", emoji="✅", style=discord.ButtonStyle.secondary, row=3)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="✅ Leave panel closed. Your settings are saved.",
+            view=self
+        )
+        self.stop()
+
 
 @bot.tree.command(
-    name="leave-toggle",
-    description="Enable or disable leave messages."
-)
-@app_commands.describe(
-    enabled="True to enable, False to disable"
+    name="leave",
+    description="Open an interactive panel to configure leave messages."
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def leave_toggle(
-    interaction: discord.Interaction,
-    enabled: bool
-):
+async def leave_command(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     settings = get_guild_leave_settings(guild_id)
 
-    settings["enabled"] = enabled
-    save_leave_settings(leave_settings)
+    view = LeavePanelView(
+        guild=interaction.guild,
+        settings=settings,
+        author_id=interaction.user.id
+    )
 
-    state = "enabled" if enabled else "disabled"
     await interaction.response.send_message(
-        f"✅ Leave messages are now **{state}**.",
+        content=view.panel_content(),
+        embed=view.build_preview(interaction.user),
+        view=view,
         ephemeral=True
     )
-
-
-# -------------------------
-# LEAVE: RESET TO DEFAULT
-# -------------------------
-
-@bot.tree.command(
-    name="leave-reset",
-    description="Reset the leave message and image back to default."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def leave_reset(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_leave_settings(guild_id)
-
-    settings["message"] = DEFAULT_LEAVE_MESSAGE
-    settings["image_url"] = DEFAULT_LEAVE_IMAGE
-    save_leave_settings(leave_settings)
-
-    await interaction.response.send_message(
-        "✅ Leave message and image/gif have been reset to default. "
-        "Your leave channel and enabled/disabled state were left "
-        "untouched. Use `/leave-test` to preview.",
-        ephemeral=True
-    )
-
-
-# -------------------------
-# LEAVE: TEST / PREVIEW
-# -------------------------
-
-@bot.tree.command(
-    name="leave-test",
-    description="Preview the current leave message."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def leave_test(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_leave_settings(guild_id)
-
-    embed = build_leave_embed(interaction.user, settings)
-
-    await interaction.response.send_message(embed=embed)
-
-
-# -------------------------
-# LEAVE: VIEW SETTINGS
-# -------------------------
-
-@bot.tree.command(
-    name="leave-settings",
-    description="View the current leave message configuration."
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def leave_settings_cmd(interaction: discord.Interaction):
-    guild_id = str(interaction.guild.id)
-    settings = get_guild_leave_settings(guild_id)
-
-    channel_id = settings.get("channel_id")
-    channel = interaction.guild.get_channel(channel_id) if channel_id else None
-
-    embed = discord.Embed(
-        title="Leave Message Settings",
-        color=discord.Color.blurple()
-    )
-    embed.add_field(
-        name="Status",
-        value="Enabled ✅" if settings.get("enabled", True) else "Disabled ❌",
-        inline=True
-    )
-    embed.add_field(
-        name="Channel",
-        value=channel.mention if channel else "Not set",
-        inline=True
-    )
-    embed.add_field(
-        name="Image/GIF",
-        value=settings.get("image_url") or "Not set",
-        inline=False
-    )
-    embed.add_field(
-        name="Message",
-        value=f"```{settings.get('message', DEFAULT_LEAVE_MESSAGE)}```",
-        inline=False
-    )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # -------------------------
@@ -2510,8 +2507,7 @@ COMMAND_CATEGORIES = [
         "welcome"
     ], True),
     ("🚪 Leave", [
-        "leave-setchannel", "leave-setmessage", "leave-setimage",
-        "leave-toggle", "leave-test", "leave-settings", "leave-reset"
+        "leave"
     ], True),
     ("🎭 Join Role", [
         "joinrole", "joinrole-toggle", "joinrole-settings"
