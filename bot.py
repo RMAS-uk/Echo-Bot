@@ -606,11 +606,25 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
 
+    print("")
+    print("=" * 60)
+    print(f"Echo is currently in {len(bot.guilds)} server(s)")
+    print("=" * 60)
+
+    for guild in bot.guilds:
+        print(
+            f"Server: {guild.name} | "
+            f"ID: {guild.id} | "
+            f"Members: {guild.member_count}"
+        )
+
+    print("=" * 60)
+    print("")
+
     # A guild that got its commands via on_guild_join has its own frozen
     # command list from that moment - a later global sync alone won't
     # update it. Re-push into every guild we're already in on every
-    # startup so newly added commands (like /automod) actually show up
-    # without needing to wait on Discord's global propagation delay.
+    # startup so newly added commands actually show up immediately.
     if not bot.startup_sync_done:
         for guild in bot.guilds:
             bot.tree.copy_global_to(guild=guild)
@@ -628,6 +642,11 @@ async def on_guild_join(guild: discord.Guild):
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
     print(f"Joined new guild: {guild.name} ({guild.id}) — commands synced.")
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    print(f"Removed from guild: {guild.name} ({guild.id})")
 
 
 # -------------------------
