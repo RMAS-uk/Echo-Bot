@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 load_dotenv("/home/container/.env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
