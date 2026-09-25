@@ -2698,6 +2698,107 @@ async def logs_settings_cmd(interaction: discord.Interaction):
 
 
 # -------------------------
+# USER INFO
+# -------------------------
+
+@bot.tree.command(
+    name="userinfo",
+    description="View detailed info about a member."
+)
+@app_commands.describe(
+    member="The member to look up (defaults to yourself)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def userinfo(
+    interaction: discord.Interaction,
+    member: discord.Member = None
+):
+    member = member or interaction.user
+
+    guild_id = str(interaction.guild.id)
+    user_id = str(member.id)
+
+    embed = discord.Embed(
+        title=f"👤 User Info — {member}",
+        color=member.color if member.color.value else discord.Color.blurple()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.add_field(
+        name="ID",
+        value=f"`{member.id}`",
+        inline=True
+    )
+
+    # Timeout status
+    if member.is_timed_out():
+        timeout_value = (
+            f"Yes, until {discord.utils.format_dt(member.timed_out_until, style='F')} "
+            f"({discord.utils.format_dt(member.timed_out_until, style='R')})"
+        )
+    else:
+        timeout_value = "No"
+
+    embed.add_field(
+        name="Timed Out",
+        value=timeout_value,
+        inline=True
+    )
+
+    # Warnings on record for this member in this guild
+    user_warnings = warnings.get(guild_id, {}).get(user_id, [])
+    warning_flag = " 🔇" if len(user_warnings) >= WARNING_MUTE_THRESHOLD else ""
+    embed.add_field(
+        name="Warnings",
+        value=f"{len(user_warnings)}{warning_flag}",
+        inline=True
+    )
+
+    embed.add_field(
+        name="Account Created",
+        value=(
+            f"{discord.utils.format_dt(member.created_at, style='F')}\n"
+            f"({discord.utils.format_dt(member.created_at, style='R')})"
+        ),
+        inline=False
+    )
+
+    if member.joined_at:
+        joined_value = (
+            f"{discord.utils.format_dt(member.joined_at, style='F')}\n"
+            f"({discord.utils.format_dt(member.joined_at, style='R')})"
+        )
+    else:
+        joined_value = "Unknown"
+
+    embed.add_field(
+        name="Joined Server",
+        value=joined_value,
+        inline=False
+    )
+
+    # Roles, highest first, excluding @everyone.
+    roles = [role.mention for role in reversed(member.roles) if not role.is_default()]
+    if roles:
+        roles_value = ", ".join(roles)
+        if len(roles_value) > 1024:
+            roles_value = roles_value[:1000] + "…"
+    else:
+        roles_value = "None"
+
+    embed.add_field(
+        name=f"Roles ({len(roles)})",
+        value=roles_value,
+        inline=False
+    )
+
+    embed.set_footer(text=f"Requested by {interaction.user}")
+    embed.timestamp = discord.utils.utcnow()
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# -------------------------
 # COMMANDS LIST
 # -------------------------
 
