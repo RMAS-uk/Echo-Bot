@@ -6,11 +6,21 @@ from collections import defaultdict
 import json
 import os
 import re
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv("/home/container/.env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Supabase is used by the private admin dashboard to show which Discord
+# servers Echo is currently installed in. Keep the service-role key ONLY
+# on the bot host - never put it in the website JavaScript.
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    "https://roedojtytmltfdcvdxca.supabase.co"
+).rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 WARNINGS_FILE = "warnings.json"
 WELCOME_FILE = "welcome_settings.json"
@@ -598,6 +608,165 @@ async def check_mention_spam(message: discord.Message) -> bool:
 
 
 # -------------------------
+# ADMIN DASHBOARD: SERVER SYNC
+# -------------------------
+
+
+def _supabase_enabled() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _supabase_headers(prefer=None) -> dict:
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+async def _supabase_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    path: str,
+    *,
+    payload=None,
+    prefer=None,
+) -> bool:
+    """Small REST helper used only for the discord_servers admin table."""
+    if not _supabase_enabled():
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+
+    try:
+        async with session.request(
+            method,
+            url,
+            headers=_supabase_headers(prefer),
+            json=payload,
+        ) as response:
+            if 200 <= response.status < 300:
+                return True
+
+            body = await response.text()
+            print(
+                f"Supabase server-sync error {response.status}: "
+                f"{body[:500]}"
+            )
+            return False
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        print(f"Supabase server-sync request failed: {exc}")
+        return False
+
+
+def _guild_dashboard_payload(guild: discord.Guild) -> dict:
+    bot_member = guild.me
+
+    payload = {
+        "guild_id": str(guild.id),
+        "name": guild.name,
+        "member_count": guild.member_count or 0,
+        "icon_url": str(guild.icon.url) if guild.icon else None,
+        "active": True,
+        "last_seen_at": discord.utils.utcnow().isoformat(),
+        "removed_at": None,
+    }
+
+    if bot_member and bot_member.joined_at:
+        payload["joined_at"] = bot_member.joined_at.isoformat()
+
+    return payload
+
+
+async def sync_guild_to_admin_dashboard(
+    guild: discord.Guild,
+    session=None,
+):
+    """Create/update one server row in Supabase for the admin dashboard."""
+    if not _supabase_enabled():
+        return
+
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        )
+
+    try:
+        await _supabase_request(
+            session,
+            "POST",
+            "discord_servers?on_conflict=guild_id",
+            payload=_guild_dashboard_payload(guild),
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+    finally:
+        if own_session:
+            await session.close()
+
+
+async def mark_guild_removed_from_admin_dashboard(guild: discord.Guild):
+    """Keep the server in history, but mark Echo as no longer installed."""
+    if not _supabase_enabled():
+        return
+
+    payload = {
+        "active": False,
+        "removed_at": discord.utils.utcnow().isoformat(),
+    }
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=10)
+    ) as session:
+        await _supabase_request(
+            session,
+            "PATCH",
+            f"discord_servers?guild_id=eq.{guild.id}",
+            payload=payload,
+            prefer="return=minimal",
+        )
+
+
+async def sync_all_guilds_to_admin_dashboard():
+    """Reconcile Supabase with Discord every time the bot starts."""
+    if not _supabase_enabled():
+        print(
+            "Admin server sync disabled: set SUPABASE_SERVICE_ROLE_KEY "
+            "in the bot .env file."
+        )
+        return
+
+    now = discord.utils.utcnow().isoformat()
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=10)
+    ) as session:
+        # Anything left active from a previous run is temporarily marked
+        # inactive. The current bot.guilds list is immediately re-activated
+        # below, which also fixes missed removals while the bot was offline.
+        await _supabase_request(
+            session,
+            "PATCH",
+            "discord_servers?active=eq.true",
+            payload={
+                "active": False,
+                "removed_at": now,
+            },
+            prefer="return=minimal",
+        )
+
+        for guild in bot.guilds:
+            await sync_guild_to_admin_dashboard(guild, session=session)
+
+    print(
+        f"Admin dashboard server list synced: {len(bot.guilds)} active server(s)."
+    )
+
+
+# -------------------------
 # BOT STARTUP
 # -------------------------
 
@@ -606,11 +775,29 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
 
+    print("")
+    print("=" * 60)
+    print(f"Echo is currently in {len(bot.guilds)} server(s)")
+    print("=" * 60)
+
+    for guild in bot.guilds:
+        print(
+            f"Server: {guild.name} | "
+            f"ID: {guild.id} | "
+            f"Members: {guild.member_count}"
+        )
+
+    print("=" * 60)
+    print("")
+
+    # Push the same server list to Supabase so the private admin dashboard
+    # can display it without exposing the Discord bot token.
+    await sync_all_guilds_to_admin_dashboard()
+
     # A guild that got its commands via on_guild_join has its own frozen
     # command list from that moment - a later global sync alone won't
     # update it. Re-push into every guild we're already in on every
-    # startup so newly added commands (like /automod) actually show up
-    # without needing to wait on Discord's global propagation delay.
+    # startup so newly added commands actually show up immediately.
     if not bot.startup_sync_done:
         for guild in bot.guilds:
             bot.tree.copy_global_to(guild=guild)
@@ -627,7 +814,20 @@ async def on_guild_join(guild: discord.Guild):
     # waiting for Discord's global command propagation.
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
+    await sync_guild_to_admin_dashboard(guild)
     print(f"Joined new guild: {guild.name} ({guild.id}) — commands synced.")
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    await mark_guild_removed_from_admin_dashboard(guild)
+    print(f"Removed from guild: {guild.name} ({guild.id})")
+
+
+@bot.event
+async def on_guild_update(before: discord.Guild, after: discord.Guild):
+    # Keep server name/icon changes current in the dashboard.
+    await sync_guild_to_admin_dashboard(after)
 
 
 # -------------------------
@@ -710,6 +910,8 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    await sync_guild_to_admin_dashboard(member.guild)
+
     # Auto-assign the configured join role, independent of welcome messages.
     guild_id = str(member.guild.id)
     joinrole_config = get_guild_joinrole_settings(guild_id)
@@ -757,6 +959,8 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    await sync_guild_to_admin_dashboard(member.guild)
+
     guild_id = str(member.guild.id)
     settings = get_guild_leave_settings(guild_id)
 
@@ -2497,87 +2701,24 @@ async def logs_settings_cmd(interaction: discord.Interaction):
 # COMMANDS LIST
 # -------------------------
 
-COMMAND_CATEGORIES = [
-    ("🛡️ Moderation", [
-        "kick", "ban", "unban", "timeout", "untimeout",
-        "warn", "warnings", "viewwarnings", "clearwarnings", "clear",
-        "giveroleall"
-    ], False),
-    ("👋 Welcome", [
-        "welcome"
-    ], True),
-    ("🚪 Leave", [
-        "leave"
-    ], True),
-    ("🎭 Join Role", [
-        "joinrole", "joinrole-toggle", "joinrole-settings"
-    ], True),
-    ("🧾 Logs", [
-        "logschannel", "logs-toggle", "logs-settings"
-    ], True),
-    ("🚨 Automod", [
-        "automod toggle"
-    ], True),
-    ("🧩 Embeds", [
-        "embed"
-    ], True),
-    ("ℹ️ Other", [
-        "commands"
-    ], True),
-]
-
-
 @bot.tree.command(
     name="commands",
-    description="Show a list of all available commands."
+    description="Get a link to the full list of commands."
 )
 async def commands_list(interaction: discord.Interaction):
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="View Commands",
+        emoji="📖",
+        style=discord.ButtonStyle.link,
+        url="https://www.echobot.co.uk/commands"
+    ))
 
-    await interaction.response.defer(ephemeral=True)
-
-    # Pull the live, synced commands so we can build clickable /command
-    # mentions instead of plain code text - much easier to scan and tap.
-    try:
-        synced = await interaction.client.tree.fetch_commands(
-            guild=interaction.guild
-        )
-        command_ids = {command.name: command.id for command in synced}
-    except discord.HTTPException:
-        command_ids = {}
-
-    def mention(name: str) -> str:
-        # Subcommands (e.g. "automod toggle") share their parent's ID -
-        # Discord's command-mention format wants the full qualified name
-        # but the top-level command's ID.
-        root = name.split(" ", 1)[0]
-        command_id = command_ids.get(root)
-        return f"</{name}:{command_id}>" if command_id else f"`/{name}`"
-
-    embed = discord.Embed(
-        title="📖 Command List",
-        description="Tap a command to run it, or type `/` to see its options.",
-        color=discord.Color.blurple()
+    await interaction.response.send_message(
+        content="📖 Full command list: https://www.echobot.co.uk/commands",
+        view=view,
+        ephemeral=True
     )
-
-    if interaction.guild.icon:
-        embed.set_thumbnail(url=interaction.guild.icon.url)
-
-    for category_name, command_names, inline in COMMAND_CATEGORIES:
-        embed.add_field(
-            name=category_name,
-            value="\n".join(mention(name) for name in command_names),
-            inline=inline
-        )
-
-    embed.set_footer(
-        text=(
-            "All commands require the Administrator permission • "
-            f"{WARNING_MUTE_THRESHOLD} warnings = auto-mute for "
-            f"{WARNING_MUTE_HOURS}h"
-        )
-    )
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # -------------------------
