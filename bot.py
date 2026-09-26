@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import timedelta
 from collections import defaultdict
+from typing import Optional
 import json
 import os
 import re
@@ -69,23 +70,41 @@ bot = ModerationBot()
 
 
 # -------------------------
-# WARNINGS
+# SHARED JSON PERSISTENCE
 # -------------------------
+#
+# Every settings file in this bot (warnings, automod, welcome, leave,
+# logs, join role) follows the same "read whole file, tolerate it being
+# missing/corrupt, write it back with indent=4" pattern. This helper is
+# used by warnings and automod below; the other *_settings.json files
+# keep their own load/save wrappers untouched.
 
-def load_warnings():
-    if not os.path.exists(WARNINGS_FILE):
+def load_json_file(path: str) -> dict:
+    if not os.path.exists(path):
         return {}
 
     try:
-        with open(WARNINGS_FILE, "r", encoding="utf-8") as file:
+        with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
     except (json.JSONDecodeError, OSError):
         return {}
 
 
-def save_warnings(data):
-    with open(WARNINGS_FILE, "w", encoding="utf-8") as file:
+def save_json_file(path: str, data: dict):
+    with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=4)
+
+
+# -------------------------
+# WARNINGS
+# -------------------------
+
+def load_warnings():
+    return load_json_file(WARNINGS_FILE)
+
+
+def save_warnings(data):
+    save_json_file(WARNINGS_FILE, data)
 
 
 warnings = load_warnings()
@@ -418,19 +437,11 @@ mention_spam_tracker = defaultdict(lambda: defaultdict(list))
 
 
 def load_automod_settings():
-    if not os.path.exists(AUTOMOD_FILE):
-        return {}
-
-    try:
-        with open(AUTOMOD_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, OSError):
-        return {}
+    return load_json_file(AUTOMOD_FILE)
 
 
 def save_automod_settings(data):
-    with open(AUTOMOD_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
+    save_json_file(AUTOMOD_FILE, data)
 
 
 automod_settings = load_automod_settings()
@@ -480,25 +491,13 @@ async def send_automod_log(
         return
 
     embed = discord.Embed(
-        title=f"🚨 Automod: {label}",
-        color=discord.Color.red(),
+        title=f"{MOD_EMOJIS['automod']} Automod: {label}",
+        color=MOD_COLORS["automod"],
         timestamp=discord.utils.utcnow()
     )
-    embed.add_field(
-        name="User",
-        value=f"{member.mention} (`{member.id}`)",
-        inline=True
-    )
-    embed.add_field(
-        name="Messages Removed",
-        value=str(removed_count),
-        inline=True
-    )
-    embed.add_field(
-        name="Action Taken",
-        value=action_taken,
-        inline=False
-    )
+    embed.add_field(name="User", value=f"{member.mention} (`{member.id}`)", inline=True)
+    embed.add_field(name="Messages Removed", value=str(removed_count), inline=True)
+    embed.add_field(name="Action Taken", value=action_taken, inline=False)
     embed.set_thumbnail(url=member.display_avatar.url)
 
     try:
@@ -534,14 +533,12 @@ async def enforce_automod_action(
         except discord.Forbidden:
             pass
 
-    try:
-        await member.send(
-            f"⚠️ Your recent messages in **{guild.name}** were removed for "
-            f"**{label}**, and you've been timed out for "
-            f"**{AUTOMOD_TIMEOUT_HOURS} hours**."
-        )
-    except discord.Forbidden:
-        pass
+    await dm_user(
+        member,
+        f"⚠️ Your recent messages in **{guild.name}** were removed for "
+        f"**{label}**, and you've been timed out for "
+        f"**{AUTOMOD_TIMEOUT_HOURS} hours**."
+    )
 
     await send_automod_log(guild, label, member, len(offending_messages), action_taken)
 
@@ -1429,6 +1426,96 @@ async def leave_command(interaction: discord.Interaction):
 
 
 # -------------------------
+# MODERATION: SHARED HELPERS
+# -------------------------
+#
+# kick/ban/timeout/warn/etc all repeated the same three things: a
+# self-target + role-hierarchy check, a best-effort DM, and a hand-rolled
+# text response. Centralising them here means every mod command checks
+# permissions the same way and reports back in the same "case card"
+# embed style instead of several slightly different wordings.
+
+MOD_COLORS = {
+    "kick": discord.Color.orange(),
+    "ban": discord.Color.red(),
+    "unban": discord.Color.green(),
+    "timeout": discord.Color.dark_gold(),
+    "untimeout": discord.Color.green(),
+    "warn": discord.Color.gold(),
+    "clearwarnings": discord.Color.green(),
+    "clear": discord.Color.blurple(),
+    "automod": discord.Color.red(),
+}
+
+MOD_EMOJIS = {
+    "kick": "👢",
+    "ban": "🔨",
+    "unban": "✅",
+    "timeout": "🔇",
+    "untimeout": "🔊",
+    "warn": "⚠️",
+    "clearwarnings": "🗑️",
+    "clear": "🧹",
+    "automod": "🚨",
+}
+
+
+def check_hierarchy(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    action: str,
+    check_self: bool = True
+) -> Optional[str]:
+    """Returns an error message if `action` shouldn't proceed (targeting
+    yourself, or targeting someone with an equal/higher role), otherwise
+    None. Shared by every command that takes a target member."""
+    if check_self and member == interaction.user:
+        return f"❌ You cannot {action} yourself."
+    if member.top_role >= interaction.user.top_role:
+        return f"❌ You cannot {action} someone with an equal or higher role."
+    return None
+
+
+async def dm_user(member: discord.abc.User, content: str) -> bool:
+    """Best-effort DM. Most mod actions still go ahead even if the
+    target has DMs closed, so callers can ignore the return value unless
+    they want to flag that the DM didn't land."""
+    try:
+        await member.send(content)
+        return True
+    except discord.Forbidden:
+        return False
+
+
+def build_mod_embed(
+    action: str,
+    title: str,
+    member,
+    moderator: discord.Member,
+    reason: Optional[str] = None,
+    extra: Optional[dict] = None
+) -> discord.Embed:
+    """The shared "case card" embed every moderation command replies
+    with, so kick/ban/timeout/warn/etc all look and read the same way."""
+    embed = discord.Embed(
+        title=f"{MOD_EMOJIS.get(action, '🛡️')} {title}",
+        color=MOD_COLORS.get(action, discord.Color.blurple()),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=f"{member.mention} (`{member.id}`)", inline=True)
+    embed.add_field(name="Moderator", value=moderator.mention, inline=True)
+
+    if extra:
+        for name, value in extra.items():
+            embed.add_field(name=name, value=value, inline=True)
+
+    embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
+
+    return embed
+
+
+# -------------------------
 # KICK
 # -------------------------
 
@@ -1447,18 +1534,9 @@ async def kick(
     reason: str = "No reason provided"
 ):
 
-    if member == interaction.user:
-        await interaction.response.send_message(
-            "❌ You cannot kick yourself.",
-            ephemeral=True
-        )
-        return
-
-    if member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "❌ You cannot kick someone with an equal or higher role.",
-            ephemeral=True
-        )
+    error = check_hierarchy(interaction, member, "kick")
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
 
     if not member.kickable:
@@ -1468,19 +1546,15 @@ async def kick(
         )
         return
 
-    try:
-        await member.send(
-            f"You have been kicked from **{interaction.guild.name}**.\n"
-            f"Reason: {reason}"
-        )
-    except discord.Forbidden:
-        pass
+    await dm_user(
+        member,
+        f"You have been kicked from **{interaction.guild.name}**.\nReason: {reason}"
+    )
 
     await member.kick(reason=reason)
 
     await interaction.response.send_message(
-        f"👢 **{member}** has been kicked.\n"
-        f"Reason: {reason}"
+        embed=build_mod_embed("kick", "Member Kicked", member, interaction.user, reason)
     )
 
 
@@ -1503,18 +1577,9 @@ async def ban(
     reason: str = "No reason provided"
 ):
 
-    if member == interaction.user:
-        await interaction.response.send_message(
-            "❌ You cannot ban yourself.",
-            ephemeral=True
-        )
-        return
-
-    if member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "❌ You cannot ban someone with an equal or higher role.",
-            ephemeral=True
-        )
+    error = check_hierarchy(interaction, member, "ban")
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
 
     if not member.bannable:
@@ -1524,22 +1589,15 @@ async def ban(
         )
         return
 
-    try:
-        await member.send(
-            f"You have been banned from **{interaction.guild.name}**.\n"
-            f"Reason: {reason}"
-        )
-    except discord.Forbidden:
-        pass
-
-    await member.ban(
-        reason=reason,
-        delete_message_seconds=0
+    await dm_user(
+        member,
+        f"You have been banned from **{interaction.guild.name}**.\nReason: {reason}"
     )
 
+    await member.ban(reason=reason, delete_message_seconds=0)
+
     await interaction.response.send_message(
-        f"🔨 **{member}** has been banned.\n"
-        f"Reason: {reason}"
+        embed=build_mod_embed("ban", "Member Banned", member, interaction.user, reason)
     )
 
 
@@ -1572,14 +1630,10 @@ async def unban(
         return
 
     try:
-        await interaction.guild.unban(
-            user,
-            reason=reason
-        )
+        await interaction.guild.unban(user, reason=reason)
 
         await interaction.response.send_message(
-            f"✅ **{user}** has been unbanned.\n"
-            f"Reason: {reason}"
+            embed=build_mod_embed("unban", "Member Unbanned", user, interaction.user, reason)
         )
 
     except discord.NotFound:
@@ -1610,18 +1664,9 @@ async def timeout(
     reason: str = "No reason provided"
 ):
 
-    if member == interaction.user:
-        await interaction.response.send_message(
-            "❌ You cannot timeout yourself.",
-            ephemeral=True
-        )
-        return
-
-    if member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "❌ You cannot timeout someone with an equal or higher role.",
-            ephemeral=True
-        )
+    error = check_hierarchy(interaction, member, "timeout")
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
 
     if not member.moderatable:
@@ -1632,15 +1677,13 @@ async def timeout(
         return
 
     try:
-        await member.timeout(
-            timedelta(minutes=minutes),
-            reason=reason
-        )
+        await member.timeout(timedelta(minutes=minutes), reason=reason)
 
         await interaction.response.send_message(
-            f"🔇 **{member}** has been timed out for "
-            f"**{minutes} minutes**.\n"
-            f"Reason: {reason}"
+            embed=build_mod_embed(
+                "timeout", "Member Timed Out", member, interaction.user, reason,
+                extra={"Duration": f"{minutes} minute(s)"}
+            )
         )
 
     except discord.Forbidden:
@@ -1667,21 +1710,16 @@ async def untimeout(
     member: discord.Member
 ):
 
-    if member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "❌ You cannot modify someone with an equal or higher role.",
-            ephemeral=True
-        )
+    error = check_hierarchy(interaction, member, "untimeout", check_self=False)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
 
     try:
-        await member.timeout(
-            None,
-            reason=f"Timeout removed by {interaction.user}"
-        )
+        await member.timeout(None, reason=f"Timeout removed by {interaction.user}")
 
         await interaction.response.send_message(
-            f"🔊 **{member}** is no longer timed out."
+            embed=build_mod_embed("untimeout", "Timeout Removed", member, interaction.user)
         )
 
     except discord.Forbidden:
@@ -1710,23 +1748,22 @@ async def warn(
     reason: str = "No reason provided"
 ):
 
+    # The original version had no hierarchy check here, unlike every
+    # other targeted mod command - added for consistency, so you can't
+    # warn a co-admin or someone above you.
+    error = check_hierarchy(interaction, member, "warn")
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
     guild_id = str(interaction.guild.id)
     user_id = str(member.id)
 
-    if guild_id not in warnings:
-        warnings[guild_id] = {}
-
-    if user_id not in warnings[guild_id]:
-        warnings[guild_id][user_id] = []
-
-    warning = {
+    warnings.setdefault(guild_id, {}).setdefault(user_id, []).append({
         "reason": reason,
         "moderator": str(interaction.user),
         "moderator_id": interaction.user.id
-    }
-
-    warnings[guild_id][user_id].append(warning)
-
+    })
     save_warnings(warnings)
 
     total = len(warnings[guild_id][user_id])
@@ -1743,43 +1780,27 @@ async def warn(
         except discord.Forbidden:
             pass
 
-    dm_lines = [
-        f"⚠️ You have received a warning in **{interaction.guild.name}**.",
-        "",
-        f"Reason: {reason}",
+    dm_content = (
+        f"⚠️ You have received a warning in **{interaction.guild.name}**.\n\n"
+        f"Reason: {reason}\n"
         f"Warning #{total}"
-    ]
+    )
     if muted:
-        dm_lines.append(
-            f"\nYou've reached **{WARNING_MUTE_THRESHOLD} warnings** and "
+        dm_content += (
+            f"\n\nYou've reached **{WARNING_MUTE_THRESHOLD} warnings** and "
             f"have been muted for **{WARNING_MUTE_HOURS} hours**."
         )
+    await dm_user(member, dm_content)
 
-    try:
-        await member.send("\n".join(dm_lines))
-    except discord.Forbidden:
-        pass
-
-    response_lines = [
-        f"⚠️ **{member}** has been warned.",
-        f"Reason: {reason}",
-        f"Total warnings: **{total}**"
-    ]
+    extra = {"Total Warnings": str(total)}
     if muted:
-        response_lines.append(
-            f"🔇 **{member}** reached {WARNING_MUTE_THRESHOLD} warnings "
-            f"and has been muted for **{WARNING_MUTE_HOURS} hours**."
-        )
+        extra["Auto-Mute"] = f"🔇 {WARNING_MUTE_HOURS}h timeout applied"
     elif total >= WARNING_MUTE_THRESHOLD:
-        response_lines.append(
-            "❌ I couldn't mute this member (missing permissions or "
-            "role hierarchy)."
-        )
+        extra["Auto-Mute"] = "❌ Couldn't mute (permissions/role hierarchy)"
 
-    await interaction.response.send_message("\n".join(response_lines))
-
-    sent_message = await interaction.original_response()
-    await sent_message.delete(delay=5)
+    await interaction.response.send_message(
+        embed=build_mod_embed("warn", "Member Warned", member, interaction.user, reason, extra=extra)
+    )
 
 
 # -------------------------
@@ -1818,15 +1839,14 @@ async def view_warnings(
         return
 
     embed = discord.Embed(
-        title=f"Warnings — {member}",
+        title=f"⚠️ Warnings — {member}",
         description=f"Total warnings: **{len(user_warnings)}**",
-        color=discord.Color.orange()
+        color=MOD_COLORS["warn"],
+        timestamp=discord.utils.utcnow()
     )
+    embed.set_thumbnail(url=member.display_avatar.url)
 
-    for number, warning in enumerate(
-        user_warnings,
-        start=1
-    ):
+    for number, warning in enumerate(user_warnings, start=1):
         embed.add_field(
             name=f"Warning #{number}",
             value=(
@@ -1836,10 +1856,7 @@ async def view_warnings(
             inline=False
         )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # -------------------------
@@ -1900,7 +1917,7 @@ async def view_all_warnings(interaction: discord.Interaction):
         latest_reason = user_warnings[-1]["reason"]
         flag = " 🔇" if count >= WARNING_MUTE_THRESHOLD else ""
 
-        embed = discord.Embed(color=discord.Color.orange())
+        embed = discord.Embed(color=MOD_COLORS["warn"])
 
         if user:
             embed.description = (
@@ -1947,18 +1964,16 @@ async def clear_warnings(
     guild_id = str(interaction.guild.id)
     user_id = str(member.id)
 
-    if guild_id in warnings:
-        if user_id in warnings[guild_id]:
-            warnings[guild_id][user_id] = []
-
+    cleared = len(warnings.get(guild_id, {}).get(user_id, []))
+    warnings.setdefault(guild_id, {})[user_id] = []
     save_warnings(warnings)
 
     await interaction.response.send_message(
-        f"✅ Warnings for **{member}** have been cleared."
+        embed=build_mod_embed(
+            "clearwarnings", "Warnings Cleared", member, interaction.user,
+            extra={"Warnings Removed": str(cleared)}
+        )
     )
-
-    sent_message = await interaction.original_response()
-    await sent_message.delete(delay=5)
 
 
 # -------------------------
@@ -1982,14 +1997,18 @@ async def clear(
         ephemeral=True
     )
 
-    deleted = await interaction.channel.purge(
-        limit=amount
-    )
+    deleted = await interaction.channel.purge(limit=amount)
 
-    await interaction.followup.send(
-        f"🧹 Deleted **{len(deleted)} messages**.",
-        ephemeral=True
+    embed = discord.Embed(
+        title=f"{MOD_EMOJIS['clear']} Messages Cleared",
+        color=MOD_COLORS["clear"],
+        timestamp=discord.utils.utcnow()
     )
+    embed.add_field(name="Channel", value=interaction.channel.mention, inline=True)
+    embed.add_field(name="Deleted", value=str(len(deleted)), inline=True)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # -------------------------
@@ -2588,17 +2607,33 @@ async def automod_toggle(
     settings["enabled"] = enabled
     save_automod_settings(automod_settings)
 
-    state = "enabled" if enabled else "disabled"
-    await interaction.response.send_message(
-        f"✅ Automod is now **{state}**.\n"
-        f"When enabled, anyone other than an administrator who posts "
-        f"**{AUTOMOD_LINK_THRESHOLD}+** messages with a link, or "
-        f"**{AUTOMOD_MENTION_THRESHOLD}+** messages with a mention "
-        f"(or **{AUTOMOD_MENTION_INSTANT_THRESHOLD}+** mentions in one "
-        f"message), within **{AUTOMOD_WINDOW_SECONDS} seconds** has those "
-        f"messages deleted and is timed out for **{AUTOMOD_TIMEOUT_HOURS} hours**.",
-        ephemeral=True
+    embed = discord.Embed(
+        title=f"{MOD_EMOJIS['automod']} Automod {'Enabled' if enabled else 'Disabled'}",
+        color=discord.Color.green() if enabled else discord.Color.dark_grey(),
+        timestamp=discord.utils.utcnow()
     )
+    embed.add_field(
+        name="Link Spam",
+        value=f"{AUTOMOD_LINK_THRESHOLD}+ linked messages in {AUTOMOD_WINDOW_SECONDS}s",
+        inline=False
+    )
+    embed.add_field(
+        name="Mention Spam",
+        value=(
+            f"{AUTOMOD_MENTION_THRESHOLD}+ messages with a mention in "
+            f"{AUTOMOD_WINDOW_SECONDS}s, or {AUTOMOD_MENTION_INSTANT_THRESHOLD}+ "
+            f"mentions in one message"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Action",
+        value=f"Delete the message(s) + {AUTOMOD_TIMEOUT_HOURS}h timeout",
+        inline=False
+    )
+    embed.set_footer(text="Administrators are always exempt.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 bot.tree.add_command(automod_group)
