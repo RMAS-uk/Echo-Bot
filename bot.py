@@ -42,6 +42,7 @@ MODERATION_COMMANDS = {
     "clearwarnings",
     "clear",
     "giveroleall",
+    "automod",
 }
 
 intents = discord.Intents.default()
@@ -414,24 +415,41 @@ def get_guild_joinrole_settings(guild_id: str):
 # AUTOMOD SETTINGS
 # -------------------------
 #
-# Deliberately not configurable beyond on/off - one guild-wide switch
-# (/automod toggle) instead of a pile of tuning commands. The rule is
-# fixed: spamming links or mentions within a short window gets you
-# deleted + timed out.
+# Fully configurable per guild via the /automod panel: link spam and
+# mention spam can be toggled independently, their thresholds and the
+# shared rolling window are all tunable, and the punishment escalates
+# per member - each automod hit is a "strike", and strikes move a
+# member from a timeout, to a kick, to a ban as they rack up.
 
 AUTOMOD_FILE = "automod_settings.json"
+AUTOMOD_STRIKES_FILE = "automod_strikes.json"
 
 URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
 
-AUTOMOD_WINDOW_SECONDS = 10            # rolling window both checks use
-AUTOMOD_LINK_THRESHOLD = 4             # linked messages inside the window -> action
-AUTOMOD_MENTION_THRESHOLD = 3          # mention-containing messages inside the window -> action
-AUTOMOD_MENTION_INSTANT_THRESHOLD = 5  # mentions in a SINGLE message -> action immediately
-AUTOMOD_TIMEOUT_HOURS = 48             # length of the timeout automod applies
+# Defaults used for brand-new guilds (and to backfill any settings a
+# guild's config is missing). Admins can change all of these per guild
+# through /automod.
+AUTOMOD_DEFAULTS = {
+    "enabled": True,
+    "window_seconds": 10,        # rolling window both checks use
+    "link_spam": {
+        "enabled": True,
+        "threshold": 4            # linked messages inside the window -> strike
+    },
+    "mention_spam": {
+        "enabled": True,
+        "threshold": 3,           # mention-containing messages inside the window -> strike
+        "instant_threshold": 5    # mentions in a SINGLE message -> strike immediately
+    },
+    "timeout_hours": 48,          # duration of the timeout used for early strikes
+    "strikes_before_kick": 2,     # strike # at which a member is kicked instead of timed out
+    "strikes_before_ban": 3,      # strike # at which a member is banned instead of kicked
+}
 
 # In-memory sliding-window trackers: {guild_id: {user_id: [Message, ...]}}
 # Not persisted to disk on purpose - this is short-lived spam-window data,
-# not something that needs to survive a restart.
+# not something that needs to survive a restart. Strike counts (below)
+# ARE persisted, since escalation needs to survive a restart.
 link_spam_tracker = defaultdict(lambda: defaultdict(list))
 mention_spam_tracker = defaultdict(lambda: defaultdict(list))
 
@@ -447,25 +465,51 @@ def save_automod_settings(data):
 automod_settings = load_automod_settings()
 
 
-def get_guild_automod_settings(guild_id: str):
-    """Return this guild's automod config ({"enabled": bool}), creating
-    the default if missing."""
-    if guild_id not in automod_settings:
-        automod_settings[guild_id] = {"enabled": True}
-        save_automod_settings(automod_settings)
-    elif "enabled" not in automod_settings[guild_id]:
-        # Migrating from the old per-category config format (link_spam /
-        # file_spam / mention_spam dicts) - just carry forward whether
-        # automod was on at all, since per-category tuning no longer exists.
-        old_cfg = automod_settings[guild_id]
-        was_enabled = any(
-            old_cfg.get(key, {}).get("enabled", True)
-            for key in ("link_spam", "file_spam", "mention_spam")
-        )
-        automod_settings[guild_id] = {"enabled": was_enabled}
-        save_automod_settings(automod_settings)
+def get_guild_automod_settings(guild_id: str) -> dict:
+    """Return this guild's automod config, filling in any keys that are
+    missing - a brand new guild, or one whose settings predate a field
+    that's since been added - with the defaults above."""
+    settings = automod_settings.setdefault(guild_id, {})
 
-    return automod_settings[guild_id]
+    settings.setdefault("enabled", AUTOMOD_DEFAULTS["enabled"])
+    settings.setdefault("window_seconds", AUTOMOD_DEFAULTS["window_seconds"])
+    settings.setdefault("timeout_hours", AUTOMOD_DEFAULTS["timeout_hours"])
+    settings.setdefault("strikes_before_kick", AUTOMOD_DEFAULTS["strikes_before_kick"])
+    settings.setdefault("strikes_before_ban", AUTOMOD_DEFAULTS["strikes_before_ban"])
+
+    link_spam = settings.setdefault("link_spam", {})
+    link_spam.setdefault("enabled", AUTOMOD_DEFAULTS["link_spam"]["enabled"])
+    link_spam.setdefault("threshold", AUTOMOD_DEFAULTS["link_spam"]["threshold"])
+
+    mention_spam = settings.setdefault("mention_spam", {})
+    mention_spam.setdefault("enabled", AUTOMOD_DEFAULTS["mention_spam"]["enabled"])
+    mention_spam.setdefault("threshold", AUTOMOD_DEFAULTS["mention_spam"]["threshold"])
+    mention_spam.setdefault("instant_threshold", AUTOMOD_DEFAULTS["mention_spam"]["instant_threshold"])
+
+    save_automod_settings(automod_settings)
+    return settings
+
+
+def load_automod_strikes():
+    return load_json_file(AUTOMOD_STRIKES_FILE)
+
+
+def save_automod_strikes(data):
+    save_json_file(AUTOMOD_STRIKES_FILE, data)
+
+
+automod_strikes = load_automod_strikes()
+
+
+def add_automod_strike(guild_id: str, user_id: str) -> int:
+    """Increments and returns this member's automod strike count for
+    this guild. Strikes persist across restarts, unlike the sliding
+    spam-detection windows above, since escalation depends on them."""
+    guild_strikes = automod_strikes.setdefault(guild_id, {})
+    guild_strikes[user_id] = guild_strikes.get(user_id, 0) + 1
+    save_automod_strikes(automod_strikes)
+    return guild_strikes[user_id]
+
 
 
 async def send_automod_log(
@@ -473,7 +517,8 @@ async def send_automod_log(
     label: str,
     member: discord.Member,
     removed_count: int,
-    action_taken: str
+    action_taken: str,
+    strikes: int
 ):
     """Reuses the existing /logschannel setup so automod hits and manual
     command usage both land in the same place."""
@@ -496,6 +541,7 @@ async def send_automod_log(
         timestamp=discord.utils.utcnow()
     )
     embed.add_field(name="User", value=f"{member.mention} (`{member.id}`)", inline=True)
+    embed.add_field(name="Strike #", value=str(strikes), inline=True)
     embed.add_field(name="Messages Removed", value=str(removed_count), inline=True)
     embed.add_field(name="Action Taken", value=action_taken, inline=False)
     embed.set_thumbnail(url=member.display_avatar.url)
@@ -508,12 +554,14 @@ async def send_automod_log(
 
 async def enforce_automod_action(
     offending_messages: list,
-    member,
+    member: discord.Member,
     label: str,
     guild: discord.Guild
 ):
-    """Deletes the given messages and times the member out for
-    AUTOMOD_TIMEOUT_HOURS, then reports it to the logs channel."""
+    """Deletes the given messages, then escalates the punishment based
+    on how many prior automod strikes this member has in this guild:
+    an early strike gets a timeout, a later strike gets kicked, and the
+    final tier gets banned - per the guild's configured thresholds."""
 
     for offending in offending_messages:
         try:
@@ -521,26 +569,47 @@ async def enforce_automod_action(
         except (discord.NotFound, discord.Forbidden):
             pass
 
-    action_taken = f"Deleted {len(offending_messages)} message(s)"
+    settings = get_guild_automod_settings(str(guild.id))
+    strikes = add_automod_strike(str(guild.id), str(member.id))
 
-    if isinstance(member, discord.Member) and member.moderatable:
+    action_taken = f"Deleted {len(offending_messages)} message(s)"
+    action_label = "warned"
+
+    if strikes >= settings["strikes_before_ban"] and member.bannable:
+        try:
+            await member.ban(
+                reason=f"Automod: {label} (strike {strikes})",
+                delete_message_seconds=0
+            )
+            action_taken += " + banned"
+            action_label = "banned"
+        except discord.Forbidden:
+            pass
+    elif strikes >= settings["strikes_before_kick"] and member.kickable:
+        try:
+            await member.kick(reason=f"Automod: {label} (strike {strikes})")
+            action_taken += " + kicked"
+            action_label = "kicked"
+        except discord.Forbidden:
+            pass
+    elif member.moderatable:
         try:
             await member.timeout(
-                timedelta(hours=AUTOMOD_TIMEOUT_HOURS),
-                reason=f"Automod: {label}"
+                timedelta(hours=settings["timeout_hours"]),
+                reason=f"Automod: {label} (strike {strikes})"
             )
-            action_taken += f" + timed out {AUTOMOD_TIMEOUT_HOURS}h"
+            action_taken += f" + timed out {settings['timeout_hours']}h"
+            action_label = f"timed out for **{settings['timeout_hours']} hours**"
         except discord.Forbidden:
             pass
 
     await dm_user(
         member,
         f"⚠️ Your recent messages in **{guild.name}** were removed for "
-        f"**{label}**, and you've been timed out for "
-        f"**{AUTOMOD_TIMEOUT_HOURS} hours**."
+        f"**{label}** (strike **{strikes}**), and you've been {action_label}."
     )
 
-    await send_automod_log(guild, label, member, len(offending_messages), action_taken)
+    await send_automod_log(guild, label, member, len(offending_messages), action_taken, strikes)
 
 
 async def check_spam_window(
@@ -548,15 +617,16 @@ async def check_spam_window(
     guild_id: int,
     message: discord.Message,
     label: str,
-    threshold: int
+    threshold: int,
+    window_seconds: int
 ) -> bool:
-    """Adds this message to the user's rolling AUTOMOD_WINDOW_SECONDS
-    window for this spam type, prunes anything outside the window, and -
-    if the count crosses the given threshold - enforces the automod
-    action. Returns True if action was taken."""
+    """Adds this message to the user's rolling window for this spam
+    type, prunes anything outside the window, and - if the count
+    crosses the given threshold - enforces the automod action. Returns
+    True if action was taken."""
 
     now = discord.utils.utcnow()
-    window = timedelta(seconds=AUTOMOD_WINDOW_SECONDS)
+    window = timedelta(seconds=window_seconds)
 
     bucket = tracker[guild_id][message.author.id]
     bucket.append(message)
@@ -574,10 +644,14 @@ async def check_spam_window(
     return True
 
 
-async def check_mention_spam(message: discord.Message) -> bool:
+async def check_mention_spam(message: discord.Message, settings: dict) -> bool:
     """A single message with a large pile of mentions is spam on its own,
     so this checks that first (instant trigger) before falling back to the
     same sliding-window pattern used for link spam."""
+
+    mention_cfg = settings["mention_spam"]
+    if not mention_cfg.get("enabled", True):
+        return False
 
     total_mentions = len(message.mentions) + len(message.role_mentions)
     if message.mention_everyone:
@@ -586,7 +660,7 @@ async def check_mention_spam(message: discord.Message) -> bool:
     if total_mentions == 0:
         return False
 
-    if total_mentions >= AUTOMOD_MENTION_INSTANT_THRESHOLD:
+    if total_mentions >= mention_cfg["instant_threshold"]:
         await enforce_automod_action(
             [message],
             message.author,
@@ -600,7 +674,8 @@ async def check_mention_spam(message: discord.Message) -> bool:
         message.guild.id,
         message,
         "Mention Spam",
-        AUTOMOD_MENTION_THRESHOLD
+        mention_cfg["threshold"],
+        settings["window_seconds"]
     )
 
 
@@ -887,18 +962,20 @@ async def on_message(message: discord.Message):
     if isinstance(message.author, discord.Member) and message.author.guild_permissions.administrator:
         return
 
-    if message.content and URL_REGEX.search(message.content):
+    link_cfg = settings["link_spam"]
+    if link_cfg.get("enabled", True) and message.content and URL_REGEX.search(message.content):
         handled = await check_spam_window(
             link_spam_tracker,
             message.guild.id,
             message,
             "Link Spam",
-            AUTOMOD_LINK_THRESHOLD
+            link_cfg["threshold"],
+            settings["window_seconds"]
         )
         if handled:
             return
 
-    await check_mention_spam(message)
+    await check_mention_spam(message, settings)
 
 
 # -------------------------
@@ -2580,63 +2657,317 @@ async def embed_command(interaction: discord.Interaction):
 
 
 # -------------------------
-# AUTOMOD: TOGGLE (the only automod command)
+# AUTOMOD: INTERACTIVE PANEL
 # -------------------------
+#
+# Same pattern as /welcome and /leave: one command opens a live panel
+# instead of a pile of separate commands. Link spam and mention spam can
+# be toggled independently, their thresholds and the shared window are
+# editable via modals, and the escalation ladder (timeout -> kick -> ban)
+# is configurable too.
 
-automod_group = app_commands.Group(
+class AutomodThresholdsModal(discord.ui.Modal, title="Automod Thresholds"):
+    link_threshold = discord.ui.TextInput(
+        label="Link spam: messages -> strike",
+        max_length=3
+    )
+    mention_threshold = discord.ui.TextInput(
+        label="Mention spam: messages -> strike",
+        max_length=3
+    )
+    mention_instant = discord.ui.TextInput(
+        label="Mentions in ONE message -> strike",
+        max_length=3
+    )
+    window_seconds = discord.ui.TextInput(
+        label="Rolling window (seconds)",
+        max_length=4
+    )
+
+    def __init__(self, view: "AutomodPanelView"):
+        super().__init__()
+        self.view = view
+        settings = view.settings
+        self.link_threshold.default = str(settings["link_spam"]["threshold"])
+        self.mention_threshold.default = str(settings["mention_spam"]["threshold"])
+        self.mention_instant.default = str(settings["mention_spam"]["instant_threshold"])
+        self.window_seconds.default = str(settings["window_seconds"])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            link_t = int(self.link_threshold.value)
+            mention_t = int(self.mention_threshold.value)
+            mention_i = int(self.mention_instant.value)
+            window_s = int(self.window_seconds.value)
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ All four fields must be whole numbers.",
+                ephemeral=True
+            )
+            return
+
+        if min(link_t, mention_t, mention_i, window_s) < 1:
+            await interaction.response.send_message(
+                "❌ All values must be at least 1.",
+                ephemeral=True
+            )
+            return
+
+        settings = self.view.settings
+        settings["link_spam"]["threshold"] = link_t
+        settings["mention_spam"]["threshold"] = mention_t
+        settings["mention_spam"]["instant_threshold"] = mention_i
+        settings["window_seconds"] = window_s
+        save_automod_settings(automod_settings)
+
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_summary(),
+            view=self.view
+        )
+
+
+class AutomodEscalationModal(discord.ui.Modal, title="Automod Escalation"):
+    timeout_hours = discord.ui.TextInput(
+        label="Timeout duration (hours)",
+        max_length=4
+    )
+    strikes_before_kick = discord.ui.TextInput(
+        label="Strike # that gets kicked instead",
+        max_length=2
+    )
+    strikes_before_ban = discord.ui.TextInput(
+        label="Strike # that gets banned instead",
+        max_length=2
+    )
+
+    def __init__(self, view: "AutomodPanelView"):
+        super().__init__()
+        self.view = view
+        settings = view.settings
+        self.timeout_hours.default = str(settings["timeout_hours"])
+        self.strikes_before_kick.default = str(settings["strikes_before_kick"])
+        self.strikes_before_ban.default = str(settings["strikes_before_ban"])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            timeout_h = int(self.timeout_hours.value)
+            kick_at = int(self.strikes_before_kick.value)
+            ban_at = int(self.strikes_before_ban.value)
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ All three fields must be whole numbers.",
+                ephemeral=True
+            )
+            return
+
+        if min(timeout_h, kick_at, ban_at) < 1:
+            await interaction.response.send_message(
+                "❌ All values must be at least 1.",
+                ephemeral=True
+            )
+            return
+
+        if ban_at < kick_at:
+            await interaction.response.send_message(
+                "❌ The ban strike # can't be lower than the kick strike #.",
+                ephemeral=True
+            )
+            return
+
+        settings = self.view.settings
+        settings["timeout_hours"] = timeout_h
+        settings["strikes_before_kick"] = kick_at
+        settings["strikes_before_ban"] = ban_at
+        save_automod_settings(automod_settings)
+
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_summary(),
+            view=self.view
+        )
+
+
+class AutomodPanelView(discord.ui.View):
+    def __init__(self, settings: dict, author_id: int):
+        super().__init__(timeout=600)
+        self.settings = settings
+        self.author_id = author_id
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        enabled = self.settings.get("enabled", True)
+        self.toggle_automod.label = "Disable Automod" if enabled else "Enable Automod"
+        self.toggle_automod.emoji = "🔕" if enabled else "🔔"
+        self.toggle_automod.style = (
+            discord.ButtonStyle.secondary if enabled else discord.ButtonStyle.success
+        )
+
+        link_on = self.settings["link_spam"].get("enabled", True)
+        self.toggle_link.label = "Disable Link Check" if link_on else "Enable Link Check"
+        self.toggle_link.style = (
+            discord.ButtonStyle.secondary if link_on else discord.ButtonStyle.success
+        )
+
+        mention_on = self.settings["mention_spam"].get("enabled", True)
+        self.toggle_mention.label = "Disable Mention Check" if mention_on else "Enable Mention Check"
+        self.toggle_mention.style = (
+            discord.ButtonStyle.secondary if mention_on else discord.ButtonStyle.success
+        )
+
+    def panel_content(self) -> str:
+        status = "Enabled ✅" if self.settings.get("enabled", True) else "Disabled ❌"
+        return (
+            f"**Automod Panel** — Status: {status}\n"
+            f"Use the buttons below to toggle detection and edit thresholds "
+            f"and escalation. Administrators are always exempt."
+        )
+
+    def build_summary(self) -> discord.Embed:
+        settings = self.settings
+        window = settings["window_seconds"]
+
+        embed = discord.Embed(
+            title=f"{MOD_EMOJIS['automod']} Automod Configuration",
+            color=MOD_COLORS["automod"],
+            timestamp=discord.utils.utcnow()
+        )
+
+        link_status = "✅ On" if settings["link_spam"].get("enabled", True) else "❌ Off"
+        embed.add_field(
+            name="Link Spam",
+            value=f"{link_status} — {settings['link_spam']['threshold']}+ linked messages / {window}s",
+            inline=False
+        )
+
+        mention_status = "✅ On" if settings["mention_spam"].get("enabled", True) else "❌ Off"
+        embed.add_field(
+            name="Mention Spam",
+            value=(
+                f"{mention_status} — {settings['mention_spam']['threshold']}+ messages "
+                f"with a mention / {window}s, or "
+                f"{settings['mention_spam']['instant_threshold']}+ mentions in one message"
+            ),
+            inline=False
+        )
+
+        kick_at = settings["strikes_before_kick"]
+        ban_at = settings["strikes_before_ban"]
+
+        escalation_lines = []
+        if kick_at > 1:
+            escalation_lines.append(
+                f"Strike 1–{kick_at - 1}: 🔇 Timeout ({settings['timeout_hours']}h)"
+            )
+        if ban_at > kick_at:
+            escalation_lines.append(f"Strike {kick_at}–{ban_at - 1}: 👢 Kick")
+        escalation_lines.append(f"Strike {ban_at}+: 🔨 Ban")
+
+        embed.add_field(
+            name="Escalation (per member, persists across restarts)",
+            value="\n".join(escalation_lines),
+            inline=False
+        )
+
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who opened this panel can use its controls.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="Disable Automod", emoji="🔕", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_automod(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["enabled"] = not self.settings.get("enabled", True)
+        save_automod_settings(automod_settings)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_summary(),
+            view=self
+        )
+
+    @discord.ui.button(label="Disable Link Check", emoji="🔗", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_link(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["link_spam"]["enabled"] = not self.settings["link_spam"].get("enabled", True)
+        save_automod_settings(automod_settings)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_summary(),
+            view=self
+        )
+
+    @discord.ui.button(label="Disable Mention Check", emoji="📣", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_mention(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["mention_spam"]["enabled"] = not self.settings["mention_spam"].get("enabled", True)
+        save_automod_settings(automod_settings)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_summary(),
+            view=self
+        )
+
+    @discord.ui.button(label="Edit Thresholds", emoji="🎚️", style=discord.ButtonStyle.primary, row=1)
+    async def edit_thresholds(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AutomodThresholdsModal(self))
+
+    @discord.ui.button(label="Edit Escalation", emoji="⚖️", style=discord.ButtonStyle.primary, row=1)
+    async def edit_escalation(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AutomodEscalationModal(self))
+
+    @discord.ui.button(label="Reset to Default", emoji="♻️", style=discord.ButtonStyle.danger, row=2)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings.clear()
+        self.settings.update(json.loads(json.dumps(AUTOMOD_DEFAULTS)))
+        save_automod_settings(automod_settings)
+        self._sync_buttons()
+
+        await interaction.response.edit_message(
+            content=self.panel_content() + "\n♻️ Reset to default settings.",
+            embed=self.build_summary(),
+            view=self
+        )
+
+    @discord.ui.button(label="Close", emoji="✅", style=discord.ButtonStyle.secondary, row=2)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="✅ Automod panel closed. Your settings are saved.",
+            view=self
+        )
+        self.stop()
+
+
+@bot.tree.command(
     name="automod",
-    description="Automatic moderation for link and mention spam."
-)
-
-
-@automod_group.command(
-    name="toggle",
-    description="Enable or disable automod."
-)
-@app_commands.describe(
-    enabled="True to enable, False to disable"
+    description="Open an interactive panel to configure automod."
 )
 @app_commands.checks.has_permissions(administrator=True)
-async def automod_toggle(
-    interaction: discord.Interaction,
-    enabled: bool
-):
+async def automod_command(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     settings = get_guild_automod_settings(guild_id)
 
-    settings["enabled"] = enabled
-    save_automod_settings(automod_settings)
+    view = AutomodPanelView(settings=settings, author_id=interaction.user.id)
 
-    embed = discord.Embed(
-        title=f"{MOD_EMOJIS['automod']} Automod {'Enabled' if enabled else 'Disabled'}",
-        color=discord.Color.green() if enabled else discord.Color.dark_grey(),
-        timestamp=discord.utils.utcnow()
+    await interaction.response.send_message(
+        content=view.panel_content(),
+        embed=view.build_summary(),
+        view=view,
+        ephemeral=True
     )
-    embed.add_field(
-        name="Link Spam",
-        value=f"{AUTOMOD_LINK_THRESHOLD}+ linked messages in {AUTOMOD_WINDOW_SECONDS}s",
-        inline=False
-    )
-    embed.add_field(
-        name="Mention Spam",
-        value=(
-            f"{AUTOMOD_MENTION_THRESHOLD}+ messages with a mention in "
-            f"{AUTOMOD_WINDOW_SECONDS}s, or {AUTOMOD_MENTION_INSTANT_THRESHOLD}+ "
-            f"mentions in one message"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Action",
-        value=f"Delete the message(s) + {AUTOMOD_TIMEOUT_HOURS}h timeout",
-        inline=False
-    )
-    embed.set_footer(text="Administrators are always exempt.")
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-bot.tree.add_command(automod_group)
 
 
 # -------------------------
