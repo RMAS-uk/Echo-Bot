@@ -4,6 +4,7 @@ from discord.ext import commands
 from datetime import timedelta
 from collections import defaultdict
 from typing import Optional
+import asyncio
 import json
 import os
 import re
@@ -60,6 +61,10 @@ class ModerationBot(commands.Bot):
         self.startup_sync_done = False
 
     async def setup_hook(self):
+        # Persistent review buttons: re-attach them on every start so the
+        # star buttons on already-posted review panels keep working.
+        self.add_view(ReviewButtonsView())
+
         # Global sync makes commands available in every server the bot is
         # in, but Discord can take up to ~1 hour to propagate a global sync
         # everywhere. on_guild_join (below) covers new servers instantly.
@@ -950,6 +955,12 @@ async def on_app_command_completion(
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Keeps the review panel pinned to the bottom of its channel. Runs
+    # first (and for bot messages too) so automod's early returns and
+    # admin exemptions below can't skip it.
+    if message.guild is not None:
+        schedule_review_sticky(message)
+
     if message.author.bot or message.guild is None:
         return
 
@@ -2968,6 +2979,655 @@ async def automod_command(interaction: discord.Interaction):
         ephemeral=True
     )
 
+
+
+# -------------------------
+# REVIEWS
+# -------------------------
+#
+# /reviews opens an admin panel (same pattern as /welcome, /leave and
+# /automod) to pick the channel reviews are posted in, restyle the panel
+# embed, and post it. The posted panel has five persistent star buttons;
+# clicking one opens a short form (who helped + written feedback), and the
+# submitted review is posted to the reviews channel as a "New Review" card.
+#
+# The star buttons use fixed custom_ids and are registered in setup_hook,
+# so they keep working after the bot restarts.
+
+REVIEWS_FILE = "reviews_settings.json"
+
+REVIEW_COOLDOWN_SECONDS = 60   # per member, per server, between reviews
+REVIEW_DEFAULT_COLOR = "A020F0"
+
+DEFAULT_REVIEW_TITLE = "⭐ Leave a Review"
+DEFAULT_REVIEW_DESCRIPTION = (
+    "How was your experience with **{brand}**?\n"
+    "Pick your star rating (1–5) below, tell us who helped you, "
+    "and drop a short review.\n\n"
+    "Thanks for your feedback! 💜"
+)
+
+# {(guild_id, user_id): datetime of last submitted review}
+review_cooldowns = {}
+
+
+def load_reviews_settings():
+    return load_json_file(REVIEWS_FILE)
+
+
+def save_reviews_settings(data):
+    save_json_file(REVIEWS_FILE, data)
+
+
+reviews_settings = load_reviews_settings()
+
+
+def get_guild_reviews_settings(guild_id: str) -> dict:
+    """Return this guild's reviews config, filling in any missing keys."""
+    settings = reviews_settings.setdefault(guild_id, {})
+
+    settings.setdefault("channel_id", None)       # where reviews get posted
+    settings.setdefault("enabled", True)
+    settings.setdefault("title", DEFAULT_REVIEW_TITLE)
+    settings.setdefault("description", DEFAULT_REVIEW_DESCRIPTION)
+    settings.setdefault("color", REVIEW_DEFAULT_COLOR)
+    settings.setdefault("image_url", None)        # banner under the panel text
+    settings.setdefault("brand", None)            # falls back to the server name
+    settings.setdefault("sticky", True)           # keep the panel at the bottom of its channel
+    settings.setdefault("panel_channel_id", None) # where the live panel currently is
+    settings.setdefault("panel_message_id", None)
+
+    save_reviews_settings(reviews_settings)
+    return settings
+
+
+def _review_brand(guild: discord.Guild, settings: dict) -> str:
+    return settings.get("brand") or guild.name
+
+
+def _review_color(settings: dict) -> discord.Color:
+    raw = str(settings.get("color") or REVIEW_DEFAULT_COLOR).strip().lstrip("#")
+    try:
+        return discord.Color(int(raw, 16))
+    except ValueError:
+        return discord.Color(int(REVIEW_DEFAULT_COLOR, 16))
+
+
+def build_review_panel_embed(guild: discord.Guild, settings: dict) -> discord.Embed:
+    """The public 'Leave a Review' embed that carries the star buttons."""
+    brand = _review_brand(guild, settings)
+
+    text = (
+        settings.get("description", DEFAULT_REVIEW_DESCRIPTION)
+        .replace("{brand}", brand)
+        .replace("{server}", guild.name)
+    )
+
+    embed = discord.Embed(
+        title=settings.get("title", DEFAULT_REVIEW_TITLE),
+        description=text,
+        color=_review_color(settings)
+    )
+
+    image_url = settings.get("image_url")
+    if image_url:
+        embed.set_image(url=image_url)
+
+    embed.set_footer(
+        text=f"{brand} • Verified Review",
+        icon_url=guild.icon.url if guild.icon else None
+    )
+
+    return embed
+
+
+def resolve_review_staff(guild: discord.Guild, raw: str) -> str:
+    """Turn whatever the reviewer typed into the 'Helped Staff Member'
+    field into a mention when we can find the person (mention, user ID,
+    username or display name), otherwise show their text as-is."""
+    raw = (raw or "").strip()
+    if not raw:
+        return "Not specified"
+
+    member = None
+
+    match = re.fullmatch(r"<@!?(\d+)>", raw) or re.fullmatch(r"(\d{15,20})", raw)
+    if match:
+        member = guild.get_member(int(match.group(1)))
+    else:
+        name = raw.lstrip("@").strip()
+        member = guild.get_member_named(name)
+        if member is None:
+            lowered = name.lower()
+            member = next(
+                (
+                    m for m in guild.members
+                    if not m.bot and lowered in (m.name.lower(), m.display_name.lower())
+                ),
+                None
+            )
+
+    if member is not None:
+        return member.mention
+
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(raw))[:100]
+
+
+def build_review_embed(
+    guild: discord.Guild,
+    settings: dict,
+    reviewer: discord.abc.User,
+    stars: int,
+    staff_text: str,
+    feedback: str
+) -> discord.Embed:
+    """The 'New Review' card posted to the reviews channel."""
+    brand = _review_brand(guild, settings)
+
+    embed = discord.Embed(
+        title="New Review",
+        description=f"{'⭐' * stars} **{stars}/5**",
+        color=_review_color(settings),
+        timestamp=discord.utils.utcnow()
+    )
+
+    embed.add_field(name="User", value=reviewer.mention, inline=False)
+    embed.add_field(name="Helped Staff Member", value=staff_text, inline=False)
+
+    quoted = "\n".join(f"> {line}" for line in feedback.strip().splitlines() if line.strip())
+    embed.add_field(name="Feedback", value=quoted[:1024] or "> —", inline=False)
+
+    embed.set_thumbnail(url=reviewer.display_avatar.url)
+    embed.set_footer(
+        text=f"{brand} • Verified Review",
+        icon_url=guild.icon.url if guild.icon else None
+    )
+
+    return embed
+
+
+class ReviewModal(discord.ui.Modal):
+    staff = discord.ui.TextInput(
+        label="Who helped you?",
+        placeholder="@staff member, username or ID",
+        required=False,
+        max_length=100
+    )
+    feedback = discord.ui.TextInput(
+        label="Your review",
+        style=discord.TextStyle.paragraph,
+        placeholder="Tell us how it went...",
+        min_length=3,
+        max_length=800
+    )
+
+    def __init__(self, stars: int):
+        super().__init__(title=f"Leave a Review - {stars} Star{'s' if stars != 1 else ''}")
+        self.stars = stars
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        settings = get_guild_reviews_settings(str(guild.id))
+
+        channel_id = settings.get("channel_id")
+        channel = guild.get_channel(channel_id) if channel_id else None
+
+        if not settings.get("enabled", True) or channel is None:
+            await interaction.response.send_message(
+                "❌ Reviews aren't set up in this server right now.",
+                ephemeral=True
+            )
+            return
+
+        embed = build_review_embed(
+            guild,
+            settings,
+            interaction.user,
+            self.stars,
+            resolve_review_staff(guild, self.staff.value),
+            self.feedback.value
+        )
+
+        try:
+            await channel.send(
+                content=f"{interaction.user.mention} 💯 thanks for your review!",
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(
+                    users=[interaction.user],
+                    roles=False,
+                    everyone=False
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message(
+                "❌ I couldn't post your review. Please let a server admin know.",
+                ephemeral=True
+            )
+            return
+
+        review_cooldowns[(guild.id, interaction.user.id)] = discord.utils.utcnow()
+
+        await interaction.response.send_message(
+            "✅ Thanks! Your review has been submitted.",
+            ephemeral=True
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"Review modal error: {error}")
+        message = "❌ Something went wrong submitting your review."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+class ReviewStarButton(discord.ui.Button):
+    def __init__(self, stars: int):
+        super().__init__(
+            label=f"{stars}⭐",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"echo_review:{stars}"
+        )
+        self.stars = stars
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+
+        settings = get_guild_reviews_settings(str(interaction.guild.id))
+
+        if not settings.get("enabled", True) or not settings.get("channel_id"):
+            await interaction.response.send_message(
+                "❌ Reviews aren't set up in this server right now.",
+                ephemeral=True
+            )
+            return
+
+        last = review_cooldowns.get((interaction.guild.id, interaction.user.id))
+        if last is not None:
+            remaining = REVIEW_COOLDOWN_SECONDS - (discord.utils.utcnow() - last).total_seconds()
+            if remaining > 0:
+                await interaction.response.send_message(
+                    f"⏳ Please wait **{int(remaining) + 1}s** before leaving another review.",
+                    ephemeral=True
+                )
+                return
+
+        await interaction.response.send_modal(ReviewModal(self.stars))
+
+
+class ReviewButtonsView(discord.ui.View):
+    """Persistent view: timeout=None plus fixed custom_ids, registered once
+    in setup_hook, so the buttons on already-posted panels keep working
+    across restarts and across every server."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        for stars in range(1, 6):
+            self.add_item(ReviewStarButton(stars))
+
+
+# --- sticky panel -----------------------------------------------------
+#
+# The most recently sent panel is tracked per server. While "sticky" is on,
+# any new message in that channel makes the bot re-post the panel at the
+# bottom and delete the old copy. Bursts of chat are coalesced: a single
+# repost happens REVIEW_STICKY_DELAY seconds after the first new message.
+
+REVIEW_STICKY_DELAY = 2
+
+review_sticky_tasks = {}   # {channel_id: asyncio.Task}
+
+
+async def post_review_panel(guild: discord.Guild, channel, settings: dict):
+    """Sends a fresh panel to `channel`, removes the previously tracked
+    panel when sticky is on, and remembers the new one."""
+    old_channel_id = settings.get("panel_channel_id")
+    old_message_id = settings.get("panel_message_id")
+
+    sent = await channel.send(
+        embed=build_review_panel_embed(guild, settings),
+        view=ReviewButtonsView()
+    )
+
+    if settings.get("sticky", True) and old_message_id:
+        old_channel = guild.get_channel(old_channel_id) if old_channel_id else None
+        if old_channel is not None:
+            try:
+                await old_channel.get_partial_message(old_message_id).delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    settings["panel_channel_id"] = channel.id
+    settings["panel_message_id"] = sent.id
+    save_reviews_settings(reviews_settings)
+
+    return sent
+
+
+def _is_review_panel_message(message: discord.Message) -> bool:
+    for row in message.components:
+        for child in getattr(row, "children", []):
+            if str(getattr(child, "custom_id", "") or "").startswith("echo_review:"):
+                return True
+    return False
+
+
+async def _repost_review_panel(guild: discord.Guild, channel_id: int):
+    try:
+        await asyncio.sleep(REVIEW_STICKY_DELAY)
+
+        settings = reviews_settings.get(str(guild.id))
+        if not settings or not settings.get("sticky", True) or not settings.get("enabled", True):
+            return
+
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            return
+
+        await post_review_panel(guild, channel, settings)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"Review sticky repost failed in {guild.name}: {exc}")
+    finally:
+        review_sticky_tasks.pop(channel_id, None)
+
+
+def schedule_review_sticky(message: discord.Message):
+    """Called for every guild message; cheap no-op unless the message is in
+    a channel that currently holds a sticky review panel."""
+    settings = reviews_settings.get(str(message.guild.id))
+    if not settings or not settings.get("sticky", True) or not settings.get("enabled", True):
+        return
+
+    if message.channel.id != settings.get("panel_channel_id"):
+        return
+
+    # Never react to the panel itself (that would loop forever).
+    if message.id == settings.get("panel_message_id") or _is_review_panel_message(message):
+        return
+
+    existing = review_sticky_tasks.get(message.channel.id)
+    if existing is not None and not existing.done():
+        return
+
+    review_sticky_tasks[message.channel.id] = asyncio.create_task(
+        _repost_review_panel(message.guild, message.channel.id)
+    )
+
+
+class ReviewsPanelTextModal(discord.ui.Modal, title="Review Panel Text"):
+    panel_title = discord.ui.TextInput(
+        label="Title",
+        max_length=256
+    )
+    description = discord.ui.TextInput(
+        label="Description ({brand} = your name)",
+        style=discord.TextStyle.paragraph,
+        max_length=2000
+    )
+    color = discord.ui.TextInput(
+        label="Color (hex, e.g. A020F0)",
+        required=False,
+        max_length=7
+    )
+    image_url = discord.ui.TextInput(
+        label="Banner image URL (leave blank to remove)",
+        required=False
+    )
+    brand = discord.ui.TextInput(
+        label="Brand name (blank = server name)",
+        required=False,
+        max_length=100
+    )
+
+    def __init__(self, view: "ReviewsAdminView"):
+        super().__init__()
+        self.view = view
+        settings = view.settings
+        self.panel_title.default = settings.get("title", DEFAULT_REVIEW_TITLE)
+        self.description.default = settings.get("description", DEFAULT_REVIEW_DESCRIPTION)
+        self.color.default = str(settings.get("color") or REVIEW_DEFAULT_COLOR)
+        if settings.get("image_url"):
+            self.image_url.default = settings["image_url"]
+        if settings.get("brand"):
+            self.brand.default = settings["brand"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = (self.color.value or "").strip().lstrip("#")
+        if color_value:
+            try:
+                int(color_value, 16)
+            except ValueError:
+                await interaction.response.send_message(
+                    "❌ That color isn't valid hex. Use something like `A020F0`.",
+                    ephemeral=True
+                )
+                return
+
+        settings = self.view.settings
+        settings["title"] = self.panel_title.value
+        settings["description"] = self.description.value.replace("\\n", "\n")
+        settings["color"] = color_value or REVIEW_DEFAULT_COLOR
+        settings["image_url"] = self.image_url.value.strip() or None
+        settings["brand"] = self.brand.value.strip() or None
+        save_reviews_settings(reviews_settings)
+
+        await interaction.response.edit_message(
+            content=self.view.panel_content(),
+            embed=self.view.build_preview(),
+            view=self.view
+        )
+
+
+class ReviewsAdminView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, settings: dict, author_id: int, default_channel):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.settings = settings
+        self.author_id = author_id
+        self.target_channel = default_channel
+
+        channel_id = settings.get("channel_id")
+        channel = guild.get_channel(channel_id) if channel_id else None
+        self.reviews_channel_select.placeholder = (
+            f"Reviews are posted in: #{channel.name}" if channel else "Reviews channel: not set"
+        )
+        self.panel_channel_select.placeholder = f"Send panel to: #{default_channel.name}"
+
+        self._sync_toggle_button()
+        self._sync_sticky_button()
+
+    def _sync_toggle_button(self):
+        enabled = self.settings.get("enabled", True)
+        self.toggle_button.label = "Disable" if enabled else "Enable"
+        self.toggle_button.emoji = "🔕" if enabled else "🔔"
+        self.toggle_button.style = (
+            discord.ButtonStyle.secondary if enabled else discord.ButtonStyle.success
+        )
+
+    def _sync_sticky_button(self):
+        sticky = self.settings.get("sticky", True)
+        self.sticky_button.label = "Sticky: On" if sticky else "Sticky: Off"
+        self.sticky_button.style = (
+            discord.ButtonStyle.success if sticky else discord.ButtonStyle.secondary
+        )
+
+    def panel_content(self) -> str:
+        status = "Enabled ✅" if self.settings.get("enabled", True) else "Disabled ❌"
+        sticky = "📌 Sticky (stays at the bottom)" if self.settings.get("sticky", True) else "Not sticky"
+        return (
+            f"**Reviews Panel** — Status: {status} • {sticky}\n"
+            f"1) Pick where finished reviews are posted. "
+            f"2) Pick where to send the review panel. "
+            f"3) Hit **Send Panel**. The preview below is what members will see."
+        )
+
+    def build_preview(self) -> discord.Embed:
+        return build_review_panel_embed(self.guild, self.settings)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who opened this panel can use its controls.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Reviews channel",
+        row=0
+    )
+    async def reviews_channel_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.ChannelSelect
+    ):
+        picked = select.values[0]
+        channel = picked.resolve() or await picked.fetch()
+
+        self.settings["channel_id"] = channel.id
+        save_reviews_settings(reviews_settings)
+        select.placeholder = f"Reviews are posted in: #{channel.name}"
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(),
+            view=self
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Send panel to this channel",
+        row=1
+    )
+    async def panel_channel_select(
+        self,
+        interaction: discord.Interaction,
+        select: discord.ui.ChannelSelect
+    ):
+        picked = select.values[0]
+        channel = picked.resolve() or await picked.fetch()
+
+        self.target_channel = channel
+        select.placeholder = f"Send panel to: #{channel.name}"
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(),
+            view=self
+        )
+
+    @discord.ui.button(label="Edit Panel", emoji="✏️", style=discord.ButtonStyle.primary, row=2)
+    async def edit_panel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ReviewsPanelTextModal(self))
+
+    @discord.ui.button(label="Disable", emoji="🔕", style=discord.ButtonStyle.secondary, row=2)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["enabled"] = not self.settings.get("enabled", True)
+        save_reviews_settings(reviews_settings)
+        self._sync_toggle_button()
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(),
+            view=self
+        )
+
+    @discord.ui.button(label="Reset to Default", emoji="♻️", style=discord.ButtonStyle.danger, row=2)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["title"] = DEFAULT_REVIEW_TITLE
+        self.settings["description"] = DEFAULT_REVIEW_DESCRIPTION
+        self.settings["color"] = REVIEW_DEFAULT_COLOR
+        self.settings["image_url"] = None
+        self.settings["brand"] = None
+        save_reviews_settings(reviews_settings)
+
+        await interaction.response.edit_message(
+            content=self.panel_content() + "\n♻️ Panel text, color, banner and brand reset to default.",
+            embed=self.build_preview(),
+            view=self
+        )
+
+    @discord.ui.button(label="Send Panel", emoji="📨", style=discord.ButtonStyle.success, row=3)
+    async def send_panel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.settings.get("channel_id"):
+            await interaction.response.send_message(
+                "❌ Pick a reviews channel first, so there's somewhere for reviews to go.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await post_review_panel(self.guild, self.target_channel, self.settings)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ I don't have permission to send messages in {self.target_channel.mention}.",
+                ephemeral=True
+            )
+            return
+
+        note = (
+            " It will stay at the bottom of the channel."
+            if self.settings.get("sticky", True) else ""
+        )
+        await interaction.response.send_message(
+            f"✅ Review panel sent to {self.target_channel.mention}.{note}",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Sticky: On", emoji="📌", style=discord.ButtonStyle.success, row=3)
+    async def sticky_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.settings["sticky"] = not self.settings.get("sticky", True)
+        save_reviews_settings(reviews_settings)
+        self._sync_sticky_button()
+
+        await interaction.response.edit_message(
+            content=self.panel_content(),
+            embed=self.build_preview(),
+            view=self
+        )
+
+    @discord.ui.button(label="Close", emoji="✅", style=discord.ButtonStyle.secondary, row=3)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="✅ Reviews panel closed. Your settings are saved.",
+            view=self
+        )
+        self.stop()
+
+
+@bot.tree.command(
+    name="reviews",
+    description="Open an interactive panel to set up the review system."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def reviews_command(interaction: discord.Interaction):
+    settings = get_guild_reviews_settings(str(interaction.guild.id))
+
+    view = ReviewsAdminView(
+        guild=interaction.guild,
+        settings=settings,
+        author_id=interaction.user.id,
+        default_channel=interaction.channel
+    )
+
+    await interaction.response.send_message(
+        content=view.panel_content(),
+        embed=view.build_preview(),
+        view=view,
+        ephemeral=True
+    )
 
 
 # -------------------------
