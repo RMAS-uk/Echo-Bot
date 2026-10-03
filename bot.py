@@ -15,6 +15,18 @@ load_dotenv("/home/container/.env")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# This bot is private: it only works in ONE server, and leaves any other
+# server it's added to. The ID below is the default; set ALLOWED_GUILD_ID in
+# the .env file if you ever want to override it.
+DEFAULT_ALLOWED_GUILD_ID = "1533843796834390116"
+
+_allowed_guild_raw = (os.getenv("ALLOWED_GUILD_ID") or DEFAULT_ALLOWED_GUILD_ID).strip()
+if not _allowed_guild_raw.isdigit():
+    raise RuntimeError(
+        "ALLOWED_GUILD_ID must be a numeric server ID."
+    )
+ALLOWED_GUILD_ID = int(_allowed_guild_raw)
+
 # Supabase is used by the private admin dashboard to show which Discord
 # servers Echo is currently installed in. Keep the service-role key ONLY
 # on the bot host - never put it in the website JavaScript.
@@ -51,25 +63,43 @@ intents.members = True
 intents.message_content = True
 
 
+class WrongServer(app_commands.CheckFailure):
+    """Raised when a command/button is used outside the allowed server."""
+
+
+class GuildOnlyTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id != ALLOWED_GUILD_ID:
+            raise WrongServer()
+        return True
+
+
 class ModerationBot(commands.Bot):
 
     def __init__(self):
         super().__init__(
             command_prefix="!",
-            intents=intents
+            intents=intents,
+            tree_cls=GuildOnlyTree
         )
-        self.startup_sync_done = False
 
     async def setup_hook(self):
         # Persistent review buttons: re-attach them on every start so the
         # star buttons on already-posted review panels keep working.
         self.add_view(ReviewButtonsView())
 
-        # Global sync makes commands available in every server the bot is
-        # in, but Discord can take up to ~1 hour to propagate a global sync
-        # everywhere. on_guild_join (below) covers new servers instantly.
+        # Commands are registered ONLY in the allowed server (guild sync is
+        # instant, no ~1 hour global propagation). The global command list
+        # is then emptied so nothing is advertised anywhere else - this also
+        # removes any global commands left over from before the bot was
+        # made private.
+        guild = discord.Object(id=ALLOWED_GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+
+        self.tree.clear_commands(guild=None)
         await self.tree.sync()
-        print("Slash commands synced globally.")
+        print(f"Slash commands synced to guild {ALLOWED_GUILD_ID} only.")
 
 
 bot = ModerationBot()
@@ -849,6 +879,22 @@ async def sync_all_guilds_to_admin_dashboard():
 
 @bot.event
 async def on_ready():
+    # Private bot: leave anything that isn't the allowed server (covers
+    # invites that happened while the bot was offline).
+    for guild in list(bot.guilds):
+        if guild.id != ALLOWED_GUILD_ID:
+            print(f"Leaving unauthorised guild: {guild.name} ({guild.id})")
+            try:
+                await guild.leave()
+            except discord.HTTPException as exc:
+                print(f"Could not leave {guild.name}: {exc}")
+
+    if bot.get_guild(ALLOWED_GUILD_ID) is None:
+        print(
+            f"WARNING: the bot is not in the allowed server ({ALLOWED_GUILD_ID}). "
+            f"Invite it there, or check ALLOWED_GUILD_ID."
+        )
+
     print(f"Logged in as {bot.user}")
     print("Moderation bot is online!")
 
@@ -871,28 +917,19 @@ async def on_ready():
     # can display it without exposing the Discord bot token.
     await sync_all_guilds_to_admin_dashboard()
 
-    # A guild that got its commands via on_guild_join has its own frozen
-    # command list from that moment - a later global sync alone won't
-    # update it. Re-push into every guild we're already in on every
-    # startup so newly added commands actually show up immediately.
-    if not bot.startup_sync_done:
-        for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-
-        bot.startup_sync_done = True
-        print(f"Re-synced commands instantly into {len(bot.guilds)} guild(s).")
-
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    # Copies the already-registered global commands into this specific
-    # guild's command cache so they show up immediately, instead of
-    # waiting for Discord's global command propagation.
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
+    if guild.id != ALLOWED_GUILD_ID:
+        print(f"Added to unauthorised guild {guild.name} ({guild.id}) - leaving.")
+        try:
+            await guild.leave()
+        except discord.HTTPException as exc:
+            print(f"Could not leave {guild.name}: {exc}")
+        return
+
     await sync_guild_to_admin_dashboard(guild)
-    print(f"Joined new guild: {guild.name} ({guild.id}) — commands synced.")
+    print(f"Joined allowed guild: {guild.name} ({guild.id})")
 
 
 @bot.event
@@ -3866,6 +3903,9 @@ async def on_app_command_error(
             "❌ You don't have permission "
             "to use this command."
         )
+
+    elif isinstance(error, WrongServer):
+        message = "❌ This bot is private and only works in its home server."
 
     elif isinstance(
         error,
