@@ -3668,6 +3668,171 @@ async def reviews_command(interaction: discord.Interaction):
 
 
 # -------------------------
+# FREE TRIALS
+# -------------------------
+#
+# /givefreetrial records that a member has been given their free trial
+# (once per member - it never overwrites the original record), and
+# /freetrial checks whether a member has been given one.
+
+FREETRIALS_FILE = "freetrials.json"
+
+
+def load_freetrials():
+    return load_json_file(FREETRIALS_FILE)
+
+
+def save_freetrials(data):
+    save_json_file(FREETRIALS_FILE, data)
+
+
+freetrials = load_freetrials()
+
+
+@bot.tree.command(
+    name="givefreetrial",
+    description="Record that a member has been given their free trial."
+)
+@app_commands.describe(
+    user="The member who is getting the free trial",
+    note="Optional note (e.g. which product/plan)"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def givefreetrial_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    note: str = None
+):
+    if user.bot:
+        await interaction.response.send_message(
+            "❌ Bots can't be given a free trial.",
+            ephemeral=True
+        )
+        return
+
+    guild_trials = freetrials.setdefault(str(interaction.guild.id), {})
+    existing = guild_trials.get(str(user.id))
+
+    if existing:
+        await interaction.response.send_message(
+            f"⚠️ {user.mention} has **already** been given a free trial by "
+            f"<@{existing['given_by']}> on <t:{existing['given_at']}:F> "
+            f"(<t:{existing['given_at']}:R>). Nothing was changed.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    guild_trials[str(user.id)] = {
+        "given_by": interaction.user.id,
+        "given_at": int(discord.utils.utcnow().timestamp()),
+        "note": (note or "").strip()[:200] or None
+    }
+    save_freetrials(freetrials)
+
+    embed = discord.Embed(
+        title="🎁 Free Trial Given",
+        description=f"{user.mention} has been given a free trial.",
+        color=discord.Color.green(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Given by", value=interaction.user.mention, inline=True)
+    if guild_trials[str(user.id)]["note"]:
+        embed.add_field(name="Note", value=guild_trials[str(user.id)]["note"], inline=True)
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    await interaction.response.send_message(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@bot.tree.command(
+    name="freetrial",
+    description="Check whether a member has been given a free trial."
+)
+@app_commands.describe(user="The member to check")
+@app_commands.checks.has_permissions(administrator=True)
+async def freetrial_command(
+    interaction: discord.Interaction,
+    user: discord.Member
+):
+    record = freetrials.get(str(interaction.guild.id), {}).get(str(user.id))
+
+    if record:
+        embed = discord.Embed(
+            title="✅ Free Trial Already Given",
+            description=f"{user.mention} **has** been given a free trial.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Given by", value=f"<@{record['given_by']}>", inline=True)
+        embed.add_field(
+            name="Given on",
+            value=f"<t:{record['given_at']}:F>\n(<t:{record['given_at']}:R>)",
+            inline=True
+        )
+        if record.get("note"):
+            embed.add_field(name="Note", value=record["note"], inline=False)
+    else:
+        embed = discord.Embed(
+            title="❌ No Free Trial Yet",
+            description=f"{user.mention} has **not** been given a free trial.",
+            color=discord.Color.red()
+        )
+
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@bot.tree.command(
+    name="removefreetrial",
+    description="Remove a member's free trial record (e.g. if it was given by mistake)."
+)
+@app_commands.describe(user="The member whose free trial record should be removed")
+@app_commands.checks.has_permissions(administrator=True)
+async def removefreetrial_command(
+    interaction: discord.Interaction,
+    user: discord.Member
+):
+    guild_trials = freetrials.get(str(interaction.guild.id), {})
+    record = guild_trials.pop(str(user.id), None)
+
+    if record is None:
+        await interaction.response.send_message(
+            f"⚠️ {user.mention} doesn't have a free trial on record, so there's nothing to remove.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
+    save_freetrials(freetrials)
+
+    embed = discord.Embed(
+        title="🗑️ Free Trial Removed",
+        description=f"{user.mention} no longer has a free trial on record.",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Removed by", value=interaction.user.mention, inline=True)
+    embed.add_field(
+        name="Originally given",
+        value=f"by <@{record['given_by']}> on <t:{record['given_at']}:F>",
+        inline=True
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    await interaction.response.send_message(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+# -------------------------
 # LOGS: SET CHANNEL
 # -------------------------
 
